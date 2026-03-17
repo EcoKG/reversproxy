@@ -11,34 +11,85 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/starlyn/reversproxy/internal/admin"
+	"github.com/starlyn/reversproxy/internal/config"
 	"github.com/starlyn/reversproxy/internal/control"
 	"github.com/starlyn/reversproxy/internal/logger"
 	"github.com/starlyn/reversproxy/internal/protocol"
+	"github.com/starlyn/reversproxy/internal/stats"
 	"github.com/starlyn/reversproxy/internal/tunnel"
 )
 
 func main() {
 	// ------------------------------------------------------------------ //
-	// Flags
+	// Flags — define all flags; config file values are applied first, then
+	// flags override them if the flag was explicitly set.
 	// ------------------------------------------------------------------ //
-	addr      := flag.String("addr",       ":8443",      "TLS control listen address")
-	dataAddr  := flag.String("data-addr",  ":8444",      "TCP data connection listen address")
-	httpAddr  := flag.String("http-addr",  ":8080",      "HTTP host-based proxy listen address (empty = disabled)")
-	httpsAddr := flag.String("https-addr", ":8445",      "HTTPS SNI-routing proxy listen address (empty = disabled)")
-	token     := flag.String("token",      "changeme",   "pre-shared auth token")
-	certFile  := flag.String("cert",       "server.crt", "TLS certificate file path")
-	keyFile   := flag.String("key",        "server.key", "TLS private key file path")
+	configFile := flag.String("config", "config.yaml", "path to YAML config file (optional)")
+	addr       := flag.String("addr",       "",           "TLS control listen address (overrides config)")
+	dataAddr   := flag.String("data-addr",  "",           "TCP data connection listen address (overrides config)")
+	httpAddr   := flag.String("http-addr",  "",           "HTTP host-based proxy listen address (overrides config)")
+	httpsAddr  := flag.String("https-addr", "",           "HTTPS SNI-routing proxy listen address (overrides config)")
+	adminAddr  := flag.String("admin-addr", "",           "Admin HTTP API listen address (overrides config)")
+	token      := flag.String("token",      "",           "pre-shared auth token (overrides config)")
+	certFile   := flag.String("cert",       "",           "TLS certificate file path (overrides config)")
+	keyFile    := flag.String("key",        "",           "TLS private key file path (overrides config)")
+	logLevel   := flag.String("log-level",  "",           "log level: debug/info/warn/error (overrides config)")
 	flag.Parse()
+
+	// ------------------------------------------------------------------ //
+	// Load config file first; command-line flags take precedence.
+	// ------------------------------------------------------------------ //
+	cfg, err := config.LoadServerConfig(*configFile)
+	if err != nil {
+		// Use a temporary logger since we haven't configured the real one yet.
+		tmpLog := logger.New("server")
+		tmpLog.Error("failed to load config file", "path", *configFile, "err", err)
+		os.Exit(1)
+	}
+
+	// Apply flag overrides — only when the flag was explicitly provided.
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "addr":
+			cfg.Addr = *addr
+		case "data-addr":
+			cfg.DataAddr = *dataAddr
+		case "http-addr":
+			cfg.HTTPAddr = *httpAddr
+		case "https-addr":
+			cfg.HTTPSAddr = *httpsAddr
+		case "admin-addr":
+			cfg.AdminAddr = *adminAddr
+		case "token":
+			cfg.AuthToken = *token
+		case "cert":
+			cfg.CertPath = *certFile
+		case "key":
+			cfg.KeyPath = *keyFile
+		case "log-level":
+			cfg.LogLevel = *logLevel
+		}
+	})
 
 	// ------------------------------------------------------------------ //
 	// Logger
 	// ------------------------------------------------------------------ //
-	log := logger.New("server")
+	log := logger.NewWithLevel("server", cfg.LogLevel)
+
+	log.Info("server configuration loaded",
+		"addr", cfg.Addr,
+		"data_addr", cfg.DataAddr,
+		"http_addr", cfg.HTTPAddr,
+		"https_addr", cfg.HTTPSAddr,
+		"admin_addr", cfg.AdminAddr,
+		"log_level", cfg.LogLevel,
+	)
 
 	// ------------------------------------------------------------------ //
 	// TLS setup
 	// ------------------------------------------------------------------ //
-	cert, err := control.LoadOrGenerateCert(*certFile, *keyFile)
+	cert, err := control.LoadOrGenerateCert(cfg.CertPath, cfg.KeyPath)
 	if err != nil {
 		log.Error("failed to load or generate TLS certificate", "err", err)
 		os.Exit(1)
@@ -46,47 +97,59 @@ func main() {
 
 	tlsCfg := control.NewServerTLSConfig(cert)
 
-	ln, err := tls.Listen("tcp", *addr, tlsCfg)
+	ln, err := tls.Listen("tcp", cfg.Addr, tlsCfg)
 	if err != nil {
-		log.Error("failed to start TLS listener", "addr", *addr, "err", err)
+		log.Error("failed to start TLS listener", "addr", cfg.Addr, "err", err)
 		os.Exit(1)
 	}
 
-	log.Info("control server listening", "addr", *addr)
+	log.Info("control server listening", "addr", cfg.Addr)
 
 	// ------------------------------------------------------------------ //
-	// Registry, tunnel manager, and root context
+	// Registry, tunnel manager, stats, and root context
 	// ------------------------------------------------------------------ //
 	reg       := control.NewClientRegistry()
 	mgr       := tunnel.NewManager()
 	ctrlConns := tunnel.NewControlConnRegistry()
+	statsReg  := stats.NewRegistry()
+	globalStats := stats.Global
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
 	// Start the data connection listener.
-	if err := tunnel.StartDataListener(ctx, *dataAddr, mgr, log); err != nil {
-		log.Error("failed to start data listener", "addr", *dataAddr, "err", err)
+	if err := tunnel.StartDataListener(ctx, cfg.DataAddr, mgr, log); err != nil {
+		log.Error("failed to start data listener", "addr", cfg.DataAddr, "err", err)
 		os.Exit(1)
 	}
 
 	// dataAddr may have been :0 (OS-assigned); use the actual bound address.
 	resolvedDataAddr := tunnel.DataAddr
 
-	// Start the HTTP host-based proxy (Phase 3).
-	if *httpAddr != "" {
-		if err := tunnel.StartHTTPProxy(ctx, *httpAddr, mgr, ctrlConns, resolvedDataAddr, log); err != nil {
-			log.Error("failed to start HTTP proxy", "addr", *httpAddr, "err", err)
+	// Start the HTTP host-based proxy.
+	if cfg.HTTPAddr != "" {
+		if err := tunnel.StartHTTPProxy(ctx, cfg.HTTPAddr, mgr, ctrlConns, resolvedDataAddr, log); err != nil {
+			log.Error("failed to start HTTP proxy", "addr", cfg.HTTPAddr, "err", err)
 			os.Exit(1)
 		}
 	}
 
-	// Start the HTTPS SNI-routing proxy (Phase 3).
-	if *httpsAddr != "" {
-		if err := tunnel.StartHTTPSProxy(ctx, *httpsAddr, mgr, ctrlConns, resolvedDataAddr, log); err != nil {
-			log.Error("failed to start HTTPS proxy", "addr", *httpsAddr, "err", err)
+	// Start the HTTPS SNI-routing proxy.
+	if cfg.HTTPSAddr != "" {
+		if err := tunnel.StartHTTPSProxy(ctx, cfg.HTTPSAddr, mgr, ctrlConns, resolvedDataAddr, log); err != nil {
+			log.Error("failed to start HTTPS proxy", "addr", cfg.HTTPSAddr, "err", err)
 			os.Exit(1)
 		}
+	}
+
+	// Start the admin API server.
+	if cfg.AdminAddr != "" {
+		adminSrv := admin.New(reg, mgr, statsReg, globalStats, log)
+		if err := adminSrv.Start(ctx, cfg.AdminAddr); err != nil {
+			log.Error("failed to start admin server", "addr", cfg.AdminAddr, "err", err)
+			os.Exit(1)
+		}
+		log.Info("admin API started", "addr", cfg.AdminAddr)
 	}
 
 	// ------------------------------------------------------------------ //
@@ -134,7 +197,10 @@ func main() {
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
-			control.HandleControlConn(ctx, c, reg, *token, log, mgr, resolvedDataAddr, ctrlConns)
+			globalStats.TotalConnections.Add(1)
+			globalStats.ActiveConnections.Add(1)
+			defer globalStats.ActiveConnections.Add(-1)
+			control.HandleControlConn(ctx, c, reg, cfg.AuthToken, log, mgr, resolvedDataAddr, ctrlConns)
 		}(conn)
 	}
 

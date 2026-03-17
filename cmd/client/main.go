@@ -13,6 +13,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/starlyn/reversproxy/internal/config"
 	"github.com/starlyn/reversproxy/internal/control"
 	"github.com/starlyn/reversproxy/internal/logger"
 	"github.com/starlyn/reversproxy/internal/protocol"
@@ -21,49 +22,96 @@ import (
 )
 
 func main() {
-	server    := flag.String("server",     "localhost:8443", "server address (host:port)")
-	token     := flag.String("token",      "changeme",       "pre-shared auth token")
-	name      := flag.String("name",       "client1",        "client label sent to the server")
-	insecure  := flag.Bool("insecure",     true,             "skip TLS certificate verification (dev only)")
-	localHost := flag.String("local-host", "127.0.0.1",      "local service hostname to tunnel")
-	localPort := flag.Int("local-port",    0,                "local service port to tunnel (0 = no tunnel)")
-	pubPort   := flag.Int("pub-port",      0,                "requested public port on server (0 = any)")
-	httpHost  := flag.String("http-host",  "",               "hostname to register for HTTP host-based routing")
-	httpPort  := flag.Int("http-port",     0,                "local port for HTTP routing")
-	httpsHost := flag.String("https-host", "",               "hostname to register for HTTPS SNI routing")
-	httpsPort := flag.Int("https-port",    0,                "local port for HTTPS routing")
+	// ------------------------------------------------------------------ //
+	// Flags — config file is loaded first; flags override.
+	// ------------------------------------------------------------------ //
+	configFile := flag.String("config",      "config.yaml",     "path to YAML config file (optional)")
+	server     := flag.String("server",      "",                "server address (overrides config)")
+	token      := flag.String("token",       "",                "pre-shared auth token (overrides config)")
+	name       := flag.String("name",        "",                "client label (overrides config)")
+	insecure   := flag.Bool("insecure",      false,             "skip TLS certificate verification (overrides config)")
+	localHost  := flag.String("local-host",  "127.0.0.1",       "local service hostname to tunnel")
+	localPort  := flag.Int("local-port",     0,                 "local service port to tunnel (0 = no tunnel)")
+	pubPort    := flag.Int("pub-port",       0,                 "requested public port on server (0 = any)")
+	httpHost   := flag.String("http-host",   "",                "hostname to register for HTTP host-based routing")
+	httpPort   := flag.Int("http-port",      0,                 "local port for HTTP routing")
+	httpsHost  := flag.String("https-host",  "",                "hostname to register for HTTPS SNI routing")
+	httpsPort  := flag.Int("https-port",     0,                 "local port for HTTPS routing")
+	logLevel   := flag.String("log-level",   "",                "log level: debug/info/warn/error (overrides config)")
 	flag.Parse()
 
-	log := logger.New("client")
-
-	// Build the tunnel configuration the client wants to maintain.
-	cfg := &reconnect.ClientConfig{}
-	if *localPort > 0 {
-		cfg.AddTunnel(*localHost, *localPort, *pubPort)
-	}
-	if *httpHost != "" && *httpPort > 0 {
-		cfg.AddHTTPTunnel(*httpHost, *localHost, *httpPort)
-	}
-	if *httpsHost != "" && *httpsPort > 0 {
-		cfg.AddHTTPSTunnel(*httpsHost, *localHost, *httpsPort)
+	// ------------------------------------------------------------------ //
+	// Load config file; then apply flag overrides.
+	// ------------------------------------------------------------------ //
+	cfg, err := config.LoadClientConfig(*configFile)
+	if err != nil {
+		// Fallback logger for startup errors.
+		tmpLog := logger.New("client")
+		tmpLog.Error("failed to load config file", "path", *configFile, "err", err)
+		return
 	}
 
-	tlsCfg := control.NewClientTLSConfig(*insecure)
+	flag.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "server":
+			cfg.ServerAddr = *server
+		case "token":
+			cfg.AuthToken = *token
+		case "name":
+			cfg.Name = *name
+		case "insecure":
+			cfg.Insecure = *insecure
+		case "log-level":
+			cfg.LogLevel = *logLevel
+		}
+	})
+
+	log := logger.NewWithLevel("client", cfg.LogLevel)
 
 	// ------------------------------------------------------------------ //
-	// Signal handling — SIGINT / SIGTERM cancels the root context, which
-	// exits the reconnect loop cleanly (not just the inner connect loop).
+	// Build the tunnel configuration.
+	// Config-file tunnels take effect first; flag-based tunnels are appended.
+	// ------------------------------------------------------------------ //
+	rcCfg := &reconnect.ClientConfig{}
+
+	for _, t := range cfg.Tunnels {
+		switch t.Type {
+		case "tcp", "":
+			rcCfg.AddTunnel(t.LocalHost, t.LocalPort, t.RequestedPort)
+		case "http":
+			rcCfg.AddHTTPTunnel(t.Hostname, t.LocalHost, t.LocalPort)
+		case "https":
+			rcCfg.AddHTTPSTunnel(t.Hostname, t.LocalHost, t.LocalPort)
+		}
+	}
+
+	// Legacy flag-based tunnel configuration (backward-compatible).
+	if *localPort > 0 {
+		rcCfg.AddTunnel(*localHost, *localPort, *pubPort)
+	}
+	if *httpHost != "" && *httpPort > 0 {
+		rcCfg.AddHTTPTunnel(*httpHost, *localHost, *httpPort)
+	}
+	if *httpsHost != "" && *httpsPort > 0 {
+		rcCfg.AddHTTPSTunnel(*httpsHost, *localHost, *httpsPort)
+	}
+
+	tlsCfg := control.NewClientTLSConfig(cfg.Insecure)
+
+	// ------------------------------------------------------------------ //
+	// Signal handling
 	// ------------------------------------------------------------------ //
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
 	backoff := reconnect.NewBackoff()
 
+	serverAddr := cfg.ServerAddr
+
 	// ------------------------------------------------------------------ //
 	// Reconnect loop
 	// ------------------------------------------------------------------ //
 	for {
-		// Exit immediately if the signal has already been received.
 		select {
 		case <-ctx.Done():
 			log.Info("client shutting down")
@@ -71,11 +119,10 @@ func main() {
 		default:
 		}
 
-		log.Info("connecting to server", "server", *server)
+		log.Info("connecting to server", "server", serverAddr)
 
-		err := connect(ctx, tlsCfg, *server, *token, *name, cfg, log)
+		err := connect(ctx, tlsCfg, serverAddr, cfg.AuthToken, cfg.Name, rcCfg, log)
 		if err != nil {
-			// If the context was cancelled (SIGINT), exit cleanly.
 			if ctx.Err() != nil {
 				log.Info("client shutting down")
 				return
@@ -89,7 +136,6 @@ func main() {
 
 			select {
 			case <-time.After(delay):
-				// Ready for next attempt.
 			case <-ctx.Done():
 				log.Info("client shutting down during backoff")
 				return
@@ -97,9 +143,6 @@ func main() {
 			continue
 		}
 
-		// connect() returned nil — server requested a clean disconnect.
-		// Don't reconnect: treat a graceful server-initiated disconnect as
-		// terminal (the server is shutting down or kicked us out).
 		log.Info("disconnected cleanly, not reconnecting")
 		return
 	}
@@ -157,7 +200,6 @@ func connect(
 	// ------------------------------------------------------------------ //
 	// Re-register all tunnels
 	// ------------------------------------------------------------------ //
-	// tunnelDataAddrs maps tunnelID → serverDataAddr for the message loop.
 	tunnelDataAddrs := make(map[string]string)
 
 	for _, tc := range cfg.Tunnels {
@@ -273,8 +315,6 @@ func connect(
 	// ------------------------------------------------------------------ //
 	// Graceful shutdown goroutine
 	// ------------------------------------------------------------------ //
-	// When the root context is cancelled (SIGINT), try to send a clean
-	// Disconnect before the defer closes the connection.
 	shutdownDone := make(chan struct{})
 	go func() {
 		defer close(shutdownDone)
@@ -283,9 +323,8 @@ func connect(
 		log.Info("signal received, sending disconnect")
 		_ = protocol.WriteMessage(conn, protocol.MsgDisconnect, protocol.Disconnect{Reason: "client shutdown"})
 
-		// Give the server 2 seconds to acknowledge.
 		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-		_, _ = protocol.ReadMessage(conn) // DisconnectAck (best-effort)
+		_, _ = protocol.ReadMessage(conn)
 		conn.Close()
 	}()
 	defer func() { <-shutdownDone }()
@@ -294,16 +333,14 @@ func connect(
 	// Message loop
 	// ------------------------------------------------------------------ //
 	for {
-		// Check for cancellation before blocking on read.
 		select {
 		case <-ctx.Done():
-			return nil // clean exit — outer loop will also check ctx.Done()
+			return nil
 		default:
 		}
 
 		env, err := protocol.ReadMessage(conn)
 		if err != nil {
-			// If context was cancelled concurrently, treat as clean.
 			if ctx.Err() != nil {
 				return nil
 			}
@@ -333,7 +370,6 @@ func connect(
 				log.Info("server requested disconnect", "reason", disc.Reason)
 			}
 			_ = protocol.WriteMessage(conn, protocol.MsgDisconnectAck, protocol.DisconnectAck{})
-			// Return nil — server-initiated clean disconnect.
 			return nil
 
 		case protocol.MsgOpenConnection:
@@ -344,7 +380,10 @@ func connect(
 			}
 			dataAddr, ok := tunnelDataAddrs[openConn.TunnelID]
 			if !ok {
-				log.Warn("received OpenConnection for unknown tunnelID", "tunnelID", openConn.TunnelID)
+				log.Warn("received OpenConnection for unknown tunnelID",
+					"tunnelID", openConn.TunnelID,
+					"known_tunnels", len(tunnelDataAddrs),
+				)
 				continue
 			}
 			tunnel.HandleOpenConnection(openConn, dataAddr, log)

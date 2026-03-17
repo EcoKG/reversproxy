@@ -202,6 +202,31 @@ func (m *Manager) GetHTTPSTunnel(hostname string) (*HTTPTunnelEntry, bool) {
 	return e, ok
 }
 
+// ListTunnels returns a snapshot of all currently registered TCP tunnels.
+func (m *Manager) ListTunnels() []*TunnelEntry {
+	m.mu.RLock()
+	out := make([]*TunnelEntry, 0, len(m.tunnels))
+	for _, e := range m.tunnels {
+		out = append(out, e)
+	}
+	m.mu.RUnlock()
+	return out
+}
+
+// ListHTTPTunnels returns a snapshot of all registered HTTP and HTTPS tunnels.
+func (m *Manager) ListHTTPTunnels() []*HTTPTunnelEntry {
+	m.mu.RLock()
+	out := make([]*HTTPTunnelEntry, 0, len(m.httpTunnels)+len(m.httpsTunnels))
+	for _, e := range m.httpTunnels {
+		out = append(out, e)
+	}
+	for _, e := range m.httpsTunnels {
+		out = append(out, e)
+	}
+	m.mu.RUnlock()
+	return out
+}
+
 // RemoveHTTPTunnelsForClient removes all HTTP and HTTPS hostname registrations
 // belonging to clientID.
 func (m *Manager) RemoveHTTPTunnelsForClient(clientID string) {
