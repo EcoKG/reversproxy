@@ -8,7 +8,7 @@ import (
 	"net"
 	"testing"
 
-	"github.com/starlyn/reversproxy/internal/protocol"
+	"github.com/EcoKG/reversproxy/internal/protocol"
 )
 
 // TestFramingRoundtrip verifies that WriteMessage followed by ReadMessage

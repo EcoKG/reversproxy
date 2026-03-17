@@ -12,14 +12,14 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/starlyn/reversproxy/internal/admin"
-	"github.com/starlyn/reversproxy/internal/config"
-	"github.com/starlyn/reversproxy/internal/control"
-	"github.com/starlyn/reversproxy/internal/logger"
-	"github.com/starlyn/reversproxy/internal/protocol"
-	"github.com/starlyn/reversproxy/internal/reconnect"
-	"github.com/starlyn/reversproxy/internal/stats"
-	"github.com/starlyn/reversproxy/internal/tunnel"
+	"github.com/EcoKG/reversproxy/internal/admin"
+	"github.com/EcoKG/reversproxy/internal/config"
+	"github.com/EcoKG/reversproxy/internal/control"
+	"github.com/EcoKG/reversproxy/internal/logger"
+	"github.com/EcoKG/reversproxy/internal/protocol"
+	"github.com/EcoKG/reversproxy/internal/reconnect"
+	"github.com/EcoKG/reversproxy/internal/stats"
+	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
 
 func main() {

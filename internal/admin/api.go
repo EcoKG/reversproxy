@@ -17,9 +17,9 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/starlyn/reversproxy/internal/control"
-	"github.com/starlyn/reversproxy/internal/stats"
-	"github.com/starlyn/reversproxy/internal/tunnel"
+	"github.com/EcoKG/reversproxy/internal/control"
+	"github.com/EcoKG/reversproxy/internal/stats"
+	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
 
 // -----------------------------------------------------------------------

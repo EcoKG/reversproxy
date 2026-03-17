@@ -1,4 +1,4 @@
-module github.com/starlyn/reversproxy
+module github.com/EcoKG/reversproxy
 
 go 1.22.10
 

@@ -6,7 +6,7 @@ import (
 	"sync"
 	"testing"
 
-	"github.com/starlyn/reversproxy/internal/control"
+	"github.com/EcoKG/reversproxy/internal/control"
 )
 
 // noopConn returns a net.Conn backed by net.Pipe suitable for tests that do

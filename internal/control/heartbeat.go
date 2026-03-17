@@ -5,7 +5,7 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/starlyn/reversproxy/internal/protocol"
+	"github.com/EcoKG/reversproxy/internal/protocol"
 )
 
 const (

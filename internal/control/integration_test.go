@@ -10,9 +10,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/starlyn/reversproxy/internal/control"
-	"github.com/starlyn/reversproxy/internal/logger"
-	"github.com/starlyn/reversproxy/internal/protocol"
+	"github.com/EcoKG/reversproxy/internal/control"
+	"github.com/EcoKG/reversproxy/internal/logger"
+	"github.com/EcoKG/reversproxy/internal/protocol"
 )
 
 // ---------------------------------------------------------------------------

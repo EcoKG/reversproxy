@@ -10,7 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/starlyn/reversproxy/internal/protocol"
+	"github.com/EcoKG/reversproxy/internal/protocol"
 )
 
 // LastHTTPAddr is set by StartHTTPProxy to the actual bound address (useful

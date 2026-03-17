@@ -6,7 +6,7 @@ import (
 	"log/slog"
 	"net"
 
-	"github.com/starlyn/reversproxy/internal/protocol"
+	"github.com/EcoKG/reversproxy/internal/protocol"
 )
 
 // HandleOpenConnection is called by the client message loop when an

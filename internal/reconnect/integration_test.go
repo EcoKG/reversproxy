@@ -14,11 +14,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/starlyn/reversproxy/internal/control"
-	"github.com/starlyn/reversproxy/internal/logger"
-	"github.com/starlyn/reversproxy/internal/protocol"
-	"github.com/starlyn/reversproxy/internal/reconnect"
-	"github.com/starlyn/reversproxy/internal/tunnel"
+	"github.com/EcoKG/reversproxy/internal/control"
+	"github.com/EcoKG/reversproxy/internal/logger"
+	"github.com/EcoKG/reversproxy/internal/protocol"
+	"github.com/EcoKG/reversproxy/internal/reconnect"
+	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
 
 // ---------------------------------------------------------------------------

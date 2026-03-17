@@ -12,8 +12,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
-	"github.com/starlyn/reversproxy/internal/protocol"
-	"github.com/starlyn/reversproxy/internal/tunnel"
+	"github.com/EcoKG/reversproxy/internal/protocol"
+	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
 
 // HandleControlConn manages the lifecycle of a single control-plane connection:
