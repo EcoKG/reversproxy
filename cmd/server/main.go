@@ -147,21 +147,6 @@ func main() {
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
-	go func() {
-		sig := <-sigCh
-		log.Info("shutting down", "signal", sig.String())
-
-		// Cancel root context — propagates to all client goroutines.
-		cancel()
-
-		// Broadcast Disconnect to every connected client.
-		for _, c := range reg.List() {
-			_ = protocol.WriteMessage(c.Conn, protocol.MsgDisconnect, protocol.Disconnect{
-				Reason: "server shutdown",
-			})
-		}
-	}()
-
 	// ------------------------------------------------------------------ //
 	// Dial loop — server connects to each configured client
 	//
@@ -195,7 +180,21 @@ func main() {
 		}()
 	}
 
-	// Wait for all client goroutines to finish (they exit when ctx is cancelled).
+	// Block until shutdown signal is received.
+	sig := <-sigCh
+	log.Info("shutting down", "signal", sig.String())
+
+	// Cancel root context — propagates to all client goroutines.
+	cancel()
+
+	// Broadcast Disconnect to every connected client.
+	for _, c := range reg.List() {
+		_ = protocol.WriteMessage(c.Conn, protocol.MsgDisconnect, protocol.Disconnect{
+			Reason: "server shutdown",
+		})
+	}
+
+	// Wait for all client goroutines to finish after context cancellation.
 	done := make(chan struct{})
 	go func() {
 		wg.Wait()
