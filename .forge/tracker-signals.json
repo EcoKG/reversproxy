@@ -2,26 +2,90 @@
   {
     "type": "typecheck_fail",
     "data": {
+      "file": "config.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T16:41:30.303Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "config.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T16:41:38.954Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
       "file": "main.go",
       "output": ""
     },
-    "timestamp": "2026-03-17T15:28:05.028Z"
+    "timestamp": "2026-03-17T16:41:47.168Z"
   },
   {
     "type": "typecheck_fail",
     "data": {
-      "file": "server.go",
+      "file": "main.go",
       "output": ""
     },
-    "timestamp": "2026-03-17T15:40:57.145Z"
+    "timestamp": "2026-03-17T16:42:02.185Z"
   },
   {
     "type": "typecheck_fail",
     "data": {
-      "file": "ctrl_registry.go",
+      "file": "main.go",
       "output": ""
     },
-    "timestamp": "2026-03-17T15:41:07.021Z"
+    "timestamp": "2026-03-17T16:42:13.306Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "main.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T16:42:20.977Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "main.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T16:42:42.614Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "main.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T16:43:00.897Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "main.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T16:43:10.435Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "main.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T16:43:20.051Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "main.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T16:43:31.687Z"
   },
   {
     "type": "typecheck_fail",
@@ -29,39 +93,31 @@
       "file": "client.go",
       "output": ""
     },
-    "timestamp": "2026-03-17T15:41:24.686Z"
+    "timestamp": "2026-03-17T16:44:42.441Z"
   },
   {
     "type": "typecheck_fail",
     "data": {
-      "file": "manager.go",
+      "file": "client.go",
       "output": ""
     },
-    "timestamp": "2026-03-17T15:41:44.970Z"
+    "timestamp": "2026-03-17T16:44:49.792Z"
   },
   {
     "type": "typecheck_fail",
     "data": {
-      "file": "manager.go",
+      "file": "client.go",
       "output": ""
     },
-    "timestamp": "2026-03-17T15:41:54.121Z"
+    "timestamp": "2026-03-17T16:44:58.666Z"
   },
   {
     "type": "typecheck_fail",
     "data": {
-      "file": "handler.go",
+      "file": "client.go",
       "output": ""
     },
-    "timestamp": "2026-03-17T15:43:06.954Z"
-  },
-  {
-    "type": "typecheck_fail",
-    "data": {
-      "file": "main.go",
-      "output": ""
-    },
-    "timestamp": "2026-03-17T15:43:25.431Z"
+    "timestamp": "2026-03-17T16:45:07.539Z"
   },
   {
     "type": "typecheck_fail",
@@ -69,7 +125,7 @@
       "file": "main.go",
       "output": ""
     },
-    "timestamp": "2026-03-17T15:44:46.670Z"
+    "timestamp": "2026-03-17T16:45:24.232Z"
   },
   {
     "type": "typecheck_fail",
@@ -77,38 +133,30 @@
       "file": "main.go",
       "output": ""
     },
-    "timestamp": "2026-03-17T15:44:56.434Z"
+    "timestamp": "2026-03-17T16:45:34.882Z"
   },
   {
     "type": "typecheck_fail",
     "data": {
-      "file": "main.go",
+      "file": "client_test.go",
       "output": ""
     },
-    "timestamp": "2026-03-17T15:45:03.195Z"
+    "timestamp": "2026-03-17T16:49:25.506Z"
   },
   {
     "type": "typecheck_fail",
     "data": {
-      "file": "server_test.go",
+      "file": "client_test.go",
       "output": ""
     },
-    "timestamp": "2026-03-17T15:46:41.409Z"
+    "timestamp": "2026-03-17T17:00:21.257Z"
   },
   {
     "type": "typecheck_fail",
     "data": {
-      "file": "server_test.go",
+      "file": "client_test.go",
       "output": ""
     },
-    "timestamp": "2026-03-17T15:47:10.488Z"
-  },
-  {
-    "type": "typecheck_fail",
-    "data": {
-      "file": "server_test.go",
-      "output": ""
-    },
-    "timestamp": "2026-03-17T15:48:25.075Z"
+    "timestamp": "2026-03-17T17:00:59.720Z"
   }
 ]

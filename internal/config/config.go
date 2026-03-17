@@ -26,6 +26,10 @@ type ClientTarget struct {
 // ServerConfig holds all server-side configuration values.
 // Values loaded from the YAML file are overridden by command-line flags in
 // the caller; the zero value of each field means "use the default".
+//
+// Note: SOCKS5 proxy settings (SOCKSAddr, SOCKSUser, SOCKSPass) have moved to
+// ClientConfig.  The server no longer runs a SOCKS5 listener; instead it acts
+// as the exit node when the CLIENT-side SOCKS5 proxy forwards a CONNECT.
 type ServerConfig struct {
 	// DataAddr is the TCP data-connection listen address (default ":8444").
 	DataAddr string `yaml:"data_addr"`
@@ -33,12 +37,6 @@ type ServerConfig struct {
 	HTTPAddr string `yaml:"http_addr"`
 	// HTTPSAddr is the HTTPS/SNI proxy listen address (empty = disabled).
 	HTTPSAddr string `yaml:"https_addr"`
-	// SOCKSAddr is the SOCKS5 proxy listen address (empty = disabled, default ":1080").
-	SOCKSAddr string `yaml:"socks_addr"`
-	// SOCKSUser is the username for SOCKS5 authentication (empty = no auth).
-	SOCKSUser string `yaml:"socks_user"`
-	// SOCKSPass is the password for SOCKS5 authentication (empty = no auth).
-	SOCKSPass string `yaml:"socks_pass"`
 	// AdminAddr is the admin HTTP API listen address (default ":9090").
 	AdminAddr string `yaml:"admin_addr"`
 	// AuthToken is the default pre-shared authentication token (default "changeme").
@@ -62,7 +60,6 @@ func DefaultServerConfig() *ServerConfig {
 		DataAddr:  ":8444",
 		HTTPAddr:  ":8080",
 		HTTPSAddr: ":8445",
-		SOCKSAddr: ":1080",
 		AdminAddr: ":9090",
 		AuthToken: "changeme",
 		CertPath:  "server.crt",
@@ -108,6 +105,16 @@ type ClientConfig struct {
 	CertPath string `yaml:"cert_path"`
 	// KeyPath is the path to the TLS private key file for the client listener.
 	KeyPath string `yaml:"key_path"`
+
+	// SOCKS5 proxy (reversed architecture — listener is on the CLIENT side).
+
+	// SOCKSAddr is the local address on which the client runs the SOCKS5 listener
+	// (default ":1080").  Set to "" to disable.
+	SOCKSAddr string `yaml:"socks_addr"`
+	// SOCKSUser is the username for SOCKS5 authentication (empty = no auth).
+	SOCKSUser string `yaml:"socks_user"`
+	// SOCKSPass is the password for SOCKS5 authentication (empty = no auth).
+	SOCKSPass string `yaml:"socks_pass"`
 }
 
 // DefaultClientConfig returns a ClientConfig populated with sensible defaults.
@@ -120,6 +127,7 @@ func DefaultClientConfig() *ClientConfig {
 		LogLevel:   "info",
 		CertPath:   "client.crt",
 		KeyPath:    "client.key",
+		SOCKSAddr:  ":1080",
 	}
 }
 

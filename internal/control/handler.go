@@ -9,12 +9,26 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
+
+// serverCtrlWriter serialises writes to the control connection from multiple
+// concurrent SOCKS relay goroutines.
+type serverCtrlWriter struct {
+	mu   sync.Mutex
+	conn net.Conn
+}
+
+func (w *serverCtrlWriter) Write(msgType protocol.MsgType, payload any) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return protocol.WriteMessage(w.conn, msgType, payload)
+}
 
 // HandleControlConn manages the lifecycle of a single control-plane connection:
 // registration handshake → message loop → cleanup.
@@ -32,6 +46,9 @@ import (
 // for data connections (used in OpenConnection replies).
 // ctrlConns may be nil; when non-nil the client's control connection is
 // registered so the HTTP/HTTPS proxy can send OpenConnection messages.
+//
+// A per-connection SOCKSMux is created internally to multiplex any SOCKS5
+// channels that the client initiates over this control connection.
 func HandleControlConn(
 	ctx context.Context,
 	conn net.Conn,
@@ -131,8 +148,16 @@ func HandleControlConn(
 		ccReg.Register(client.ID, conn)
 	}
 
+	// Server-side SOCKS mux — one per control connection.
+	// Each entry represents an internet target the server has dialled on behalf
+	// of the client's local SOCKS5 user.
+	serverMux := tunnel.NewSOCKSMux()
+	cw := &serverCtrlWriter{conn: conn}
+
 	// Ensure cleanup runs regardless of how we exit.
 	defer func() {
+		// Close all active SOCKS channels so relay goroutines exit cleanly.
+		serverMux.CloseAll()
 		if mgr != nil {
 			mgr.RemoveTunnelsForClient(client.ID)
 			mgr.RemoveHTTPTunnelsForClient(client.ID)
@@ -218,12 +243,36 @@ func HandleControlConn(
 			}
 			handleRequestHTTPSTunnel(env, client, conn, mgr, dataAddr, log)
 
-		case protocol.MsgSOCKSReady:
-			if mgr == nil {
-				log.Warn("tunnel manager not configured, ignoring MsgSOCKSReady", "id", client.ID)
+		// ------------------------------------------------------------------
+		// Reversed SOCKS5 messages (Phase 4 reversed):
+		// Client sends MsgSOCKSConnect → server dials internet → relay via mux.
+		// ------------------------------------------------------------------
+
+		case protocol.MsgSOCKSConnect:
+			var sc protocol.SOCKSConnect
+			if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&sc); err != nil {
+				log.Warn("failed to decode SOCKSConnect", "id", client.ID, "err", err)
 				continue
 			}
-			handleSOCKSReady(env, client, mgr, log)
+			handleServerSOCKSConnect(clientCtx, sc, cw, serverMux, log)
+
+		case protocol.MsgSOCKSData:
+			var sd protocol.SOCKSData
+			if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&sd); err != nil {
+				log.Warn("failed to decode SOCKSData", "id", client.ID, "err", err)
+				continue
+			}
+			if err := serverMux.Deliver(sd.ConnID, sd.Payload); err != nil {
+				log.Debug("SOCKSData deliver failed", "connID", sd.ConnID, "err", err)
+			}
+
+		case protocol.MsgSOCKSClose:
+			var sc protocol.SOCKSClose
+			if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&sc); err != nil {
+				log.Warn("failed to decode SOCKSClose", "id", client.ID, "err", err)
+				continue
+			}
+			serverMux.DeliverClose(sc.ConnID)
 
 		default:
 			log.Warn("unhandled message type", "id", client.ID, "type", env.Type)
@@ -231,23 +280,125 @@ func HandleControlConn(
 	}
 }
 
-// handleSOCKSReady processes a MsgSOCKSReady message from a client.
-// It forwards the dial result to the SOCKS5 handler waiting on the pending slot.
-func handleSOCKSReady(
-	env *protocol.Envelope,
-	client *Client,
-	mgr *tunnel.Manager,
+// handleServerSOCKSConnect is called when the server receives a MsgSOCKSConnect
+// from the client.  It dials the internet target, creates a server-side mux
+// channel, and relays data bidirectionally over MsgSOCKSData frames.
+func handleServerSOCKSConnect(
+	ctx context.Context,
+	sc protocol.SOCKSConnect,
+	cw *serverCtrlWriter,
+	mux *tunnel.SOCKSMux,
 	log *slog.Logger,
 ) {
-	var ready protocol.SOCKSReady
-	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&ready); err != nil {
-		log.Warn("failed to decode SOCKSReady", "id", client.ID, "err", err)
-		return
-	}
+	log = log.With("connID", sc.ConnID, "target", fmt.Sprintf("%s:%d", sc.TargetHost, sc.TargetPort))
 
-	if err := mgr.FulfillSOCKS(ready.ConnID, ready.Success, ready.Error); err != nil {
-		log.Warn("FulfillSOCKS failed", "id", client.ID, "connID", ready.ConnID, "err", err)
-	}
+	go func() {
+		targetAddr := fmt.Sprintf("%s:%d", sc.TargetHost, sc.TargetPort)
+
+		// Allocate the server-side channel before dialling so that incoming
+		// MsgSOCKSData frames (if the client sends them early) have a home.
+		ch, err := mux.NewChannel(sc.ConnID)
+		if err != nil {
+			log.Warn("server: mux.NewChannel failed", "err", err)
+			_ = cw.Write(protocol.MsgSOCKSReady, protocol.SOCKSReady{
+				ConnID:  sc.ConnID,
+				Success: false,
+				Error:   err.Error(),
+			})
+			return
+		}
+		defer mux.Remove(sc.ConnID)
+
+		// Dial the internet target (server has internet access).
+		targetConn, err := net.DialTimeout("tcp", targetAddr, 15*time.Second)
+		if err != nil {
+			log.Warn("server: failed to dial target", "err", err)
+			_ = cw.Write(protocol.MsgSOCKSReady, protocol.SOCKSReady{
+				ConnID:  sc.ConnID,
+				Success: false,
+				Error:   err.Error(),
+			})
+			return
+		}
+		defer targetConn.Close()
+
+		// Notify the client that the dial succeeded.
+		if err := cw.Write(protocol.MsgSOCKSReady, protocol.SOCKSReady{
+			ConnID:  sc.ConnID,
+			Success: true,
+		}); err != nil {
+			log.Warn("server: failed to send SOCKSReady", "err", err)
+			return
+		}
+
+		log.Info("server: SOCKS relay started")
+
+		// outSend carries payloads from the internet target to the mux writer.
+		outSend := make(chan []byte, 64)
+		muxWriterDone := make(chan struct{})
+
+		// Goroutine A: internet target → client
+		// Reads from targetConn; pumps payloads into outSend.
+		// Closes outSend when target closes the connection / sends FIN.
+		go func() {
+			defer close(outSend)
+			buf := make([]byte, 32*1024)
+			for {
+				n, err := targetConn.Read(buf)
+				if n > 0 {
+					payload := make([]byte, n)
+					copy(payload, buf[:n])
+					outSend <- payload
+				}
+				if err != nil {
+					return
+				}
+			}
+		}()
+
+		// Goroutine B: client → internet target
+		// Reads from ch.Recv (MsgSOCKSData from client), writes to targetConn.
+		// Exits when ch.Recv returns EOF (ch.recvW closed by mux.Remove /
+		// DeliverClose triggered by the client's MsgSOCKSClose).
+		recvDone := make(chan struct{})
+		go func() {
+			defer close(recvDone)
+			_, _ = io.Copy(targetConn, ch.Recv)
+		}()
+
+		// Mux writer: drains outSend → MsgSOCKSData frames to client.
+		go func() {
+			defer close(muxWriterDone)
+			for payload := range outSend {
+				if err := cw.Write(protocol.MsgSOCKSData, protocol.SOCKSData{
+					ConnID:  sc.ConnID,
+					Payload: payload,
+				}); err != nil {
+					for range outSend {
+					}
+					return
+				}
+			}
+		}()
+
+		// Half-close sequence (mirror of client side):
+		//   1. Wait until goroutine A and mux writer have flushed all data.
+		//   2. Send MsgSOCKSClose — client will unblock goroutine B on its side.
+		//   3. The client's MsgSOCKSClose arrives here via the message loop →
+		//      serverMux.DeliverClose(connID) → ch.recvW closed → goroutine B
+		//      on this side gets EOF and exits.
+		//   4. Wait for goroutine B.
+		<-muxWriterDone
+		_ = cw.Write(protocol.MsgSOCKSClose, protocol.SOCKSClose{ConnID: sc.ConnID})
+
+		// Wait for goroutine B to exit (triggered by client's MsgSOCKSClose).
+		<-recvDone
+
+		// Cleanup.
+		mux.Remove(sc.ConnID)
+
+		log.Info("server: SOCKS relay finished")
+	}()
 }
 
 // handleRequestHTTPTunnel processes a MsgRequestHTTPTunnel from a client.

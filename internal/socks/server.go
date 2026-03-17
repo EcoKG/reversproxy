@@ -1,14 +1,22 @@
-// Package socks implements a SOCKS5 proxy listener (RFC 1928 / RFC 1929).
+// Package socks implements SOCKS5 proxy support (RFC 1928 / RFC 1929).
 //
-// Architecture:
+// # Deprecated server-side architecture (server.go)
 //
 //	Browser (SOCKS5) → Server:1080 → control channel → Client → Internet
 //
-// The server performs the SOCKS5 handshake and extracts the target host:port.
-// It then signals the connected client (via the control channel) to dial that
-// target. The client performs DNS resolution and dials, then opens a data
-// connection back to the server. Finally, the server relays raw TCP data
-// bidirectionally between the SOCKS5 client and the tunnel data connection.
+// This is the OLD architecture where the SOCKS5 listener was on the server.
+// It is kept for reference / backward compatibility but is no longer used by
+// cmd/server/main.go.
+//
+// # Current (reversed) client-side architecture (client.go)
+//
+//	SOCKS5 user → Client:1080 → control channel → Server → Internet
+//
+// The client (on the closed network) runs the SOCKS5 listener locally.  When
+// a CONNECT request arrives the client sends MsgSOCKSConnect to the server.
+// The server (which has internet access) dials the target and relays data back
+// through MsgSOCKSData / MsgSOCKSClose frames multiplexed over the control
+// connection.
 package socks
 
 import (

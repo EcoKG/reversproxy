@@ -18,7 +18,6 @@ import (
 	"github.com/EcoKG/reversproxy/internal/logger"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/reconnect"
-	"github.com/EcoKG/reversproxy/internal/socks"
 	"github.com/EcoKG/reversproxy/internal/stats"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
@@ -28,13 +27,12 @@ func main() {
 	// Flags — define all flags; config file values are applied first, then
 	// flags override them if the flag was explicitly set.
 	// ------------------------------------------------------------------ //
+	// Note: SOCKS5 is now a CLIENT-side feature.  The server acts as the exit
+	// node and no longer needs its own SOCKS5 listener flags.
 	configFile := flag.String("config",      "config.yaml", "path to YAML config file (optional)")
 	dataAddr   := flag.String("data-addr",   "",            "TCP data connection listen address (overrides config)")
 	httpAddr   := flag.String("http-addr",   "",            "HTTP host-based proxy listen address (overrides config)")
 	httpsAddr  := flag.String("https-addr",  "",            "HTTPS SNI-routing proxy listen address (overrides config)")
-	socksAddr  := flag.String("socks-addr",  "",            "SOCKS5 proxy listen address (overrides config; empty disables)")
-	socksUser  := flag.String("socks-user",  "",            "SOCKS5 auth username (overrides config; empty = no auth)")
-	socksPass  := flag.String("socks-pass",  "",            "SOCKS5 auth password (overrides config; empty = no auth)")
 	adminAddr  := flag.String("admin-addr",  "",            "Admin HTTP API listen address (overrides config)")
 	token      := flag.String("token",       "",            "default pre-shared auth token (overrides config)")
 	certFile   := flag.String("cert",        "",            "TLS certificate file path (overrides config)")
@@ -61,12 +59,6 @@ func main() {
 			cfg.HTTPAddr = *httpAddr
 		case "https-addr":
 			cfg.HTTPSAddr = *httpsAddr
-		case "socks-addr":
-			cfg.SOCKSAddr = *socksAddr
-		case "socks-user":
-			cfg.SOCKSUser = *socksUser
-		case "socks-pass":
-			cfg.SOCKSPass = *socksPass
 		case "admin-addr":
 			cfg.AdminAddr = *adminAddr
 		case "token":
@@ -86,12 +78,13 @@ func main() {
 	log := logger.NewWithLevel("server", cfg.LogLevel)
 
 	log.Info("server configuration loaded",
-		"data_addr", cfg.DataAddr,
-		"http_addr", cfg.HTTPAddr,
-		"https_addr", cfg.HTTPSAddr,
-		"admin_addr", cfg.AdminAddr,
-		"log_level", cfg.LogLevel,
+		"data_addr",     cfg.DataAddr,
+		"http_addr",     cfg.HTTPAddr,
+		"https_addr",    cfg.HTTPSAddr,
+		"admin_addr",    cfg.AdminAddr,
+		"log_level",     cfg.LogLevel,
 		"client_targets", len(cfg.Clients),
+		"note",          "SOCKS5 listener is now on the CLIENT side",
 	)
 
 	// ------------------------------------------------------------------ //
@@ -141,13 +134,9 @@ func main() {
 		}
 	}
 
-	// Start the SOCKS5 proxy.
-	if cfg.SOCKSAddr != "" {
-		if err := socks.StartSOCKSProxy(ctx, cfg.SOCKSAddr, mgr, ctrlConns, resolvedDataAddr, log, cfg.SOCKSUser, cfg.SOCKSPass); err != nil {
-			log.Error("failed to start SOCKS5 proxy", "addr", cfg.SOCKSAddr, "err", err)
-			os.Exit(1)
-		}
-	}
+	// Note: SOCKS5 proxy is no longer started on the server.  The client binary
+	// now runs the SOCKS5 listener locally and tunnels CONNECT requests to the
+	// server (which dials the internet target) via MsgSOCKSConnect/MsgSOCKSData.
 
 	// Start the admin API server.
 	if cfg.AdminAddr != "" {

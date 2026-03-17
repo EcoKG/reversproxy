@@ -23,8 +23,14 @@ const (
 	MsgHTTPTunnelResp     MsgType = 13 // server → client: HTTP/HTTPS tunnel registration result
 
 	// SOCKS5 proxy messages (Phase 4).
-	MsgSOCKSConnect MsgType = 14 // server → client: dial target host:port on behalf of a SOCKS5 client
-	MsgSOCKSReady   MsgType = 15 // client → server: result of the dial attempt
+	//
+	// Reversed architecture: SOCKS5 listener lives on the CLIENT (closed network).
+	// Data is multiplexed through the existing control connection to avoid any
+	// separate data-port connectivity requirement.
+	MsgSOCKSConnect MsgType = 14 // client → server: dial target host:port on behalf of a SOCKS5 user
+	MsgSOCKSReady   MsgType = 15 // server → client: result of the server's dial attempt
+	MsgSOCKSData    MsgType = 16 // bidirectional: relay raw bytes for a SOCKS channel
+	MsgSOCKSClose   MsgType = 17 // bidirectional: close a SOCKS channel
 )
 
 // MaxMessageSize is the maximum allowed byte length of a framed message.
@@ -163,11 +169,10 @@ type HTTPTunnelResp struct {
 	Error string
 }
 
-// SOCKSConnect is sent by the server to the client when a SOCKS5 user
-// issues a CONNECT request. The client must dial TargetHost:TargetPort,
-// open a data connection back to the server, and then relay data.
-// DNS resolution happens on the client side; the domain name is forwarded
-// verbatim rather than pre-resolved on the server.
+// SOCKSConnect is sent by the CLIENT to the SERVER when a local SOCKS5 user
+// issues a CONNECT request.  The server must dial TargetHost:TargetPort (it
+// has internet access), then reply with SOCKSReady.  DNS resolution therefore
+// happens on the server side.
 type SOCKSConnect struct {
 	// ConnID uniquely identifies this SOCKS5 connection.
 	ConnID string
@@ -177,14 +182,31 @@ type SOCKSConnect struct {
 	TargetPort int
 }
 
-// SOCKSReady is sent by the client back to the server after it has dialled
-// the target. Success indicates whether the dial succeeded. On failure,
-// Error carries a human-readable description.
+// SOCKSReady is sent by the SERVER back to the CLIENT after it has dialled
+// the internet target. Success indicates whether the dial succeeded. On
+// failure, Error carries a human-readable description.
 type SOCKSReady struct {
 	// ConnID matches the ConnID from the corresponding SOCKSConnect.
 	ConnID string
-	// Success is true when the client successfully connected to the target.
+	// Success is true when the server successfully connected to the target.
 	Success bool
 	// Error is a human-readable failure description (empty on success).
 	Error string
+}
+
+// SOCKSData carries raw TCP payload for a multiplexed SOCKS channel over the
+// control connection.  Both sides (client and server) send this message to
+// relay data between the local SOCKS5 user and the remote internet target.
+type SOCKSData struct {
+	// ConnID identifies the SOCKS channel this payload belongs to.
+	ConnID string
+	// Payload is the raw TCP data to forward.
+	Payload []byte
+}
+
+// SOCKSClose signals the end of a SOCKS channel.  Either side may send this
+// to indicate that its half of the connection has been closed.
+type SOCKSClose struct {
+	// ConnID identifies the SOCKS channel to close.
+	ConnID string
 }

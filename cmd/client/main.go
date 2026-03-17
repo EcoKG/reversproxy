@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"net"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/EcoKG/reversproxy/internal/logger"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/reconnect"
+	"github.com/EcoKG/reversproxy/internal/socks"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
 
@@ -37,6 +39,9 @@ func main() {
 	httpPort   := flag.Int("http-port",      0,              "local port for HTTP routing")
 	httpsHost  := flag.String("https-host",  "",             "hostname to register for HTTPS SNI routing")
 	httpsPort  := flag.Int("https-port",     0,              "local port for HTTPS routing")
+	socksAddr  := flag.String("socks-addr",  "",             "local SOCKS5 listener address (overrides config; empty = use config default)")
+	socksUser  := flag.String("socks-user",  "",             "SOCKS5 auth username (overrides config; empty = no auth)")
+	socksPass  := flag.String("socks-pass",  "",             "SOCKS5 auth password (overrides config; empty = no auth)")
 	logLevel   := flag.String("log-level",   "",             "log level: debug/info/warn/error (overrides config)")
 	certFile   := flag.String("cert",        "",             "TLS certificate file path (overrides config)")
 	keyFile    := flag.String("key",         "",             "TLS private key file path (overrides config)")
@@ -68,6 +73,12 @@ func main() {
 			cfg.CertPath = *certFile
 		case "key":
 			cfg.KeyPath = *keyFile
+		case "socks-addr":
+			cfg.SOCKSAddr = *socksAddr
+		case "socks-user":
+			cfg.SOCKSUser = *socksUser
+		case "socks-pass":
+			cfg.SOCKSPass = *socksPass
 		}
 	})
 
@@ -164,7 +175,7 @@ func main() {
 		log.Info("server connected", "remote", conn.RemoteAddr())
 
 		// Handle each server connection in its own goroutine.
-		go handleServerConn(ctx, conn, cfg.AuthToken, cfg.Name, rcCfg, log)
+		go handleServerConn(ctx, conn, cfg.AuthToken, cfg.Name, rcCfg, cfg.SOCKSAddr, cfg.SOCKSUser, cfg.SOCKSPass, log)
 	}
 }
 
@@ -173,12 +184,14 @@ func main() {
 //  1. Performs the reversed registration handshake (reads ClientRegister from
 //     server, validates the token, sends RegisterResp with the client's name).
 //  2. Re-registers all configured tunnels.
-//  3. Runs the message loop until the connection is lost or ctx is cancelled.
+//  3. Starts the local SOCKS5 listener (if socksAddr != "").
+//  4. Runs the message loop until the connection is lost or ctx is cancelled.
 func handleServerConn(
 	ctx context.Context,
 	conn net.Conn,
 	authToken, name string,
 	cfg *reconnect.ClientConfig,
+	socksAddr, socksUser, socksPass string,
 	log *slog.Logger,
 ) {
 	defer conn.Close()
@@ -383,6 +396,34 @@ func handleServerConn(
 	}
 
 	// ------------------------------------------------------------------ //
+	// Client-side SOCKS5 proxy (reversed architecture)
+	//
+	// Now that we have a live control connection, start the local SOCKS5
+	// listener.  All CONNECT requests will be forwarded to the server (which
+	// has internet access) via MsgSOCKSConnect/MsgSOCKSData/MsgSOCKSClose.
+	// ------------------------------------------------------------------ //
+
+	// clientMux dispatches inbound MsgSOCKSReady / MsgSOCKSData / MsgSOCKSClose
+	// frames to the correct channel goroutine started by the SOCKS listener.
+	clientMux := tunnel.NewSOCKSMux()
+
+	// sharedWriter serialises all writes to conn from both the SOCKS listener
+	// goroutines and the main message-loop (Pong, DisconnectAck, etc.).
+	sharedWriter := &clientConnWriter{conn: conn}
+
+	if socksAddr != "" {
+		socksCtx, socksCancel := context.WithCancel(ctx)
+		defer socksCancel()
+
+		if err := socks.StartClientSOCKSProxy(socksCtx, socksAddr, sharedWriter, clientMux, log, socksUser, socksPass); err != nil {
+			log.Error("failed to start client SOCKS5 proxy", "addr", socksAddr, "err", err)
+			// Non-fatal: continue running even without SOCKS5.
+		} else {
+			fmt.Printf("SOCKS5 proxy: socks5://127.0.0.1%s (use HTTPS_PROXY or ALL_PROXY)\n", socks.LastClientSOCKSAddr)
+		}
+	}
+
+	// ------------------------------------------------------------------ //
 	// Graceful shutdown goroutine
 	// ------------------------------------------------------------------ //
 	shutdownDone := make(chan struct{})
@@ -391,13 +432,16 @@ func handleServerConn(
 		<-ctx.Done()
 
 		log.Info("signal received, sending disconnect")
-		_ = protocol.WriteMessage(conn, protocol.MsgDisconnect, protocol.Disconnect{Reason: "client shutdown"})
+		_ = sharedWriter.WriteMsg(protocol.MsgDisconnect, protocol.Disconnect{Reason: "client shutdown"})
 
 		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 		_, _ = protocol.ReadMessage(conn)
 		conn.Close()
 	}()
-	defer func() { <-shutdownDone }()
+	defer func() {
+		clientMux.CloseAll()
+		<-shutdownDone
+	}()
 
 	// ------------------------------------------------------------------ //
 	// Message loop
@@ -425,7 +469,7 @@ func handleServerConn(
 				log.Warn("failed to decode Ping", "err", err)
 				continue
 			}
-			if err := protocol.WriteMessage(conn, protocol.MsgPong, protocol.Pong{Seq: ping.Seq}); err != nil {
+			if err := sharedWriter.WriteMsg(protocol.MsgPong, protocol.Pong{Seq: ping.Seq}); err != nil {
 				if ctx.Err() != nil {
 					return
 				}
@@ -441,7 +485,7 @@ func handleServerConn(
 			} else {
 				log.Info("server requested disconnect", "reason", disc.Reason)
 			}
-			_ = protocol.WriteMessage(conn, protocol.MsgDisconnectAck, protocol.DisconnectAck{})
+			_ = sharedWriter.WriteMsg(protocol.MsgDisconnectAck, protocol.DisconnectAck{})
 			return
 
 		case protocol.MsgOpenConnection:
@@ -460,27 +504,53 @@ func handleServerConn(
 			}
 			tunnel.HandleOpenConnection(openConn, dataAddr, log)
 
-		case protocol.MsgSOCKSConnect:
-			var socksConn protocol.SOCKSConnect
-			if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&socksConn); err != nil {
-				log.Warn("failed to decode SOCKSConnect", "err", err)
+		// ---- Reversed SOCKS5 messages (Phase 4 reversed) ----
+		// The server sends these back to us after we sent MsgSOCKSConnect.
+
+		case protocol.MsgSOCKSReady:
+			var ready protocol.SOCKSReady
+			if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&ready); err != nil {
+				log.Warn("failed to decode SOCKSReady", "err", err)
 				continue
 			}
-			if serverDataAddr == "" {
-				log.Warn("received SOCKSConnect but server data addr is unknown",
-					"connID", socksConn.ConnID,
-				)
-				_ = protocol.WriteMessage(conn, protocol.MsgSOCKSReady, protocol.SOCKSReady{
-					ConnID:  socksConn.ConnID,
-					Success: false,
-					Error:   "client: server data addr unknown",
-				})
+			if err := clientMux.DeliverReady(ready.ConnID, ready.Success, ready.Error); err != nil {
+				log.Debug("SOCKSReady deliver failed", "connID", ready.ConnID, "err", err)
+			}
+
+		case protocol.MsgSOCKSData:
+			var sd protocol.SOCKSData
+			if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&sd); err != nil {
+				log.Warn("failed to decode SOCKSData", "err", err)
 				continue
 			}
-			tunnel.HandleSOCKSConnect(socksConn, conn, serverDataAddr, log)
+			if err := clientMux.Deliver(sd.ConnID, sd.Payload); err != nil {
+				log.Debug("SOCKSData deliver failed", "connID", sd.ConnID, "err", err)
+			}
+
+		case protocol.MsgSOCKSClose:
+			var sc protocol.SOCKSClose
+			if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&sc); err != nil {
+				log.Warn("failed to decode SOCKSClose", "err", err)
+				continue
+			}
+			clientMux.DeliverClose(sc.ConnID)
 
 		default:
 			log.Warn("unhandled message type", "type", env.Type)
 		}
 	}
+}
+
+// clientConnWriter wraps a net.Conn with a mutex so that all writes from
+// concurrent goroutines (SOCKS relay goroutines + message loop) are serialised.
+// It implements socks.ControlWriter.
+type clientConnWriter struct {
+	mu   sync.Mutex
+	conn net.Conn
+}
+
+func (w *clientConnWriter) WriteMsg(msgType protocol.MsgType, payload any) error {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return protocol.WriteMessage(w.conn, msgType, payload)
 }
