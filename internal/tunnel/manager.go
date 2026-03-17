@@ -24,21 +24,42 @@ type TunnelEntry struct {
 	listener   net.Listener // the public TCP listener for this tunnel
 }
 
+// HTTPTunnelEntry describes an HTTP or HTTPS tunnel registered by a client.
+type HTTPTunnelEntry struct {
+	ID        string
+	ClientID  string
+	Hostname  string
+	LocalHost string
+	LocalPort int
+	IsTLS     bool // true for HTTPS/SNI tunnels, false for plain HTTP
+	// CtrlConn is the control connection to the owning client, used to send
+	// OpenConnection messages when a matching HTTP/HTTPS request arrives.
+	CtrlConn interface{ Write([]byte) (int, error) }
+}
+
 // Manager tracks all active tunnels and pending data connections.
 // It is safe for concurrent use.
 type Manager struct {
-	mu       sync.RWMutex
-	tunnels  map[string]*TunnelEntry  // tunnelID → entry
-	byClient map[string][]string      // clientID → []tunnelID
-	pending  map[string]*pendingConn  // connID → pendingConn
+	mu          sync.RWMutex
+	tunnels     map[string]*TunnelEntry     // tunnelID → entry
+	byClient    map[string][]string         // clientID → []tunnelID
+	pending     map[string]*pendingConn     // connID → pendingConn
+	httpTunnels map[string]*HTTPTunnelEntry // hostname → HTTPTunnelEntry (plain HTTP)
+	httpsTunnels map[string]*HTTPTunnelEntry // hostname → HTTPTunnelEntry (HTTPS/SNI)
+	httpByClient map[string][]string        // clientID → []hostname (HTTP)
+	httpsByClient map[string][]string       // clientID → []hostname (HTTPS)
 }
 
 // NewManager returns an initialised Manager.
 func NewManager() *Manager {
 	return &Manager{
-		tunnels:  make(map[string]*TunnelEntry),
-		byClient: make(map[string][]string),
-		pending:  make(map[string]*pendingConn),
+		tunnels:       make(map[string]*TunnelEntry),
+		byClient:      make(map[string][]string),
+		pending:       make(map[string]*pendingConn),
+		httpTunnels:   make(map[string]*HTTPTunnelEntry),
+		httpsTunnels:  make(map[string]*HTTPTunnelEntry),
+		httpByClient:  make(map[string][]string),
+		httpsByClient: make(map[string][]string),
 	}
 }
 
@@ -128,4 +149,72 @@ func WaitReady(p *pendingConn) net.Conn {
 // PendingExtConn returns the external user connection from a pendingConn.
 func PendingExtConn(p *pendingConn) net.Conn {
 	return p.extConn
+}
+
+// AddHTTPTunnel registers a hostname for plain-HTTP routing.
+// Returns the new entry. If the hostname is already registered the old entry is replaced.
+func (m *Manager) AddHTTPTunnel(tunnelID, clientID, hostname, localHost string, localPort int) *HTTPTunnelEntry {
+	entry := &HTTPTunnelEntry{
+		ID:        tunnelID,
+		ClientID:  clientID,
+		Hostname:  hostname,
+		LocalHost: localHost,
+		LocalPort: localPort,
+		IsTLS:     false,
+	}
+	m.mu.Lock()
+	m.httpTunnels[hostname] = entry
+	m.httpByClient[clientID] = append(m.httpByClient[clientID], hostname)
+	m.mu.Unlock()
+	return entry
+}
+
+// AddHTTPSTunnel registers a hostname for HTTPS/SNI routing.
+func (m *Manager) AddHTTPSTunnel(tunnelID, clientID, hostname, localHost string, localPort int) *HTTPTunnelEntry {
+	entry := &HTTPTunnelEntry{
+		ID:        tunnelID,
+		ClientID:  clientID,
+		Hostname:  hostname,
+		LocalHost: localHost,
+		LocalPort: localPort,
+		IsTLS:     true,
+	}
+	m.mu.Lock()
+	m.httpsTunnels[hostname] = entry
+	m.httpsByClient[clientID] = append(m.httpsByClient[clientID], hostname)
+	m.mu.Unlock()
+	return entry
+}
+
+// GetHTTPTunnel looks up an HTTP tunnel by hostname. Returns nil, false if not found.
+func (m *Manager) GetHTTPTunnel(hostname string) (*HTTPTunnelEntry, bool) {
+	m.mu.RLock()
+	e, ok := m.httpTunnels[hostname]
+	m.mu.RUnlock()
+	return e, ok
+}
+
+// GetHTTPSTunnel looks up an HTTPS tunnel by SNI hostname. Returns nil, false if not found.
+func (m *Manager) GetHTTPSTunnel(hostname string) (*HTTPTunnelEntry, bool) {
+	m.mu.RLock()
+	e, ok := m.httpsTunnels[hostname]
+	m.mu.RUnlock()
+	return e, ok
+}
+
+// RemoveHTTPTunnelsForClient removes all HTTP and HTTPS hostname registrations
+// belonging to clientID.
+func (m *Manager) RemoveHTTPTunnelsForClient(clientID string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+
+	for _, h := range m.httpByClient[clientID] {
+		delete(m.httpTunnels, h)
+	}
+	delete(m.httpByClient, clientID)
+
+	for _, h := range m.httpsByClient[clientID] {
+		delete(m.httpsTunnels, h)
+	}
+	delete(m.httpsByClient, clientID)
 }

@@ -21,11 +21,13 @@ func main() {
 	// ------------------------------------------------------------------ //
 	// Flags
 	// ------------------------------------------------------------------ //
-	addr     := flag.String("addr",      ":8443",      "TLS control listen address")
-	dataAddr := flag.String("data-addr", ":8444",      "TCP data connection listen address")
-	token    := flag.String("token",     "changeme",   "pre-shared auth token")
-	certFile := flag.String("cert",      "server.crt", "TLS certificate file path")
-	keyFile  := flag.String("key",       "server.key", "TLS private key file path")
+	addr      := flag.String("addr",       ":8443",      "TLS control listen address")
+	dataAddr  := flag.String("data-addr",  ":8444",      "TCP data connection listen address")
+	httpAddr  := flag.String("http-addr",  ":8080",      "HTTP host-based proxy listen address (empty = disabled)")
+	httpsAddr := flag.String("https-addr", ":8445",      "HTTPS SNI-routing proxy listen address (empty = disabled)")
+	token     := flag.String("token",      "changeme",   "pre-shared auth token")
+	certFile  := flag.String("cert",       "server.crt", "TLS certificate file path")
+	keyFile   := flag.String("key",        "server.key", "TLS private key file path")
 	flag.Parse()
 
 	// ------------------------------------------------------------------ //
@@ -55,8 +57,9 @@ func main() {
 	// ------------------------------------------------------------------ //
 	// Registry, tunnel manager, and root context
 	// ------------------------------------------------------------------ //
-	reg := control.NewClientRegistry()
-	mgr := tunnel.NewManager()
+	reg       := control.NewClientRegistry()
+	mgr       := tunnel.NewManager()
+	ctrlConns := tunnel.NewControlConnRegistry()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -69,6 +72,22 @@ func main() {
 
 	// dataAddr may have been :0 (OS-assigned); use the actual bound address.
 	resolvedDataAddr := tunnel.DataAddr
+
+	// Start the HTTP host-based proxy (Phase 3).
+	if *httpAddr != "" {
+		if err := tunnel.StartHTTPProxy(ctx, *httpAddr, mgr, ctrlConns, resolvedDataAddr, log); err != nil {
+			log.Error("failed to start HTTP proxy", "addr", *httpAddr, "err", err)
+			os.Exit(1)
+		}
+	}
+
+	// Start the HTTPS SNI-routing proxy (Phase 3).
+	if *httpsAddr != "" {
+		if err := tunnel.StartHTTPSProxy(ctx, *httpsAddr, mgr, ctrlConns, resolvedDataAddr, log); err != nil {
+			log.Error("failed to start HTTPS proxy", "addr", *httpsAddr, "err", err)
+			os.Exit(1)
+		}
+	}
 
 	// ------------------------------------------------------------------ //
 	// Graceful shutdown signal handler
@@ -115,7 +134,7 @@ func main() {
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
-			control.HandleControlConn(ctx, c, reg, *token, log, mgr, resolvedDataAddr)
+			control.HandleControlConn(ctx, c, reg, *token, log, mgr, resolvedDataAddr, ctrlConns)
 		}(conn)
 	}
 

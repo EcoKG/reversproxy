@@ -16,6 +16,11 @@ const (
 	MsgTunnelResp     MsgType = 8  // server → client: assigned public port or error
 	MsgOpenConnection MsgType = 9  // server → client: a new external user has connected; open a data conn
 	MsgDataConnHello  MsgType = 10 // client → server (data conn): identifies which connID this data conn handles
+
+	// HTTP/HTTPS routing messages (Phase 3).
+	MsgRequestHTTPTunnel  MsgType = 11 // client → server: register a hostname for HTTP routing
+	MsgRequestHTTPSTunnel MsgType = 12 // client → server: register a hostname for HTTPS/SNI routing
+	MsgHTTPTunnelResp     MsgType = 13 // server → client: HTTP/HTTPS tunnel registration result
 )
 
 // MaxMessageSize is the maximum allowed byte length of a framed message.
@@ -112,4 +117,44 @@ type OpenConnection struct {
 // connection to identify which external connection it is handling.
 type DataConnHello struct {
 	ConnID string
+}
+
+// RequestHTTPTunnel is sent by the client to register a hostname so that
+// HTTP requests with a matching Host header are routed to this client's
+// local service at LocalHost:LocalPort.
+type RequestHTTPTunnel struct {
+	// Hostname is the virtual host to register (e.g. "foo.example.com").
+	Hostname string
+	// LocalHost is the hostname/IP of the local service (e.g. "127.0.0.1").
+	LocalHost string
+	// LocalPort is the port of the local service.
+	LocalPort int
+}
+
+// RequestHTTPSTunnel is sent by the client to register a hostname for
+// HTTPS/SNI-based routing. The proxy peeks the TLS ClientHello SNI and
+// forwards the raw TCP stream to the matching client, so TLS termination
+// occurs at the client's local service.
+type RequestHTTPSTunnel struct {
+	// Hostname is the SNI hostname to register (e.g. "foo.example.com").
+	Hostname string
+	// LocalHost is the hostname/IP of the local TLS service.
+	LocalHost string
+	// LocalPort is the port of the local TLS service.
+	LocalPort int
+}
+
+// HTTPTunnelResp is the server's reply to a RequestHTTPTunnel or
+// RequestHTTPSTunnel message.
+type HTTPTunnelResp struct {
+	// Hostname echoes back the registered hostname.
+	Hostname string
+	// TunnelID uniquely identifies this HTTP/HTTPS tunnel on the server.
+	TunnelID string
+	// ServerDataAddr is the host:port clients must dial to open a data connection.
+	ServerDataAddr string
+	// Status is "ok" on success and "error" on failure.
+	Status string
+	// Error is a human-readable failure description (empty on success).
+	Error string
 }

@@ -35,7 +35,7 @@
     "auto_discuss": true
   },
   "current_milestone": 1,
-  "current_phase": 2,
+  "current_phase": 3,
   "milestones": [
     {
       "id": 1,
@@ -46,8 +46,8 @@
   ],
   "stats": {
     "total_phases": 6,
-    "completed_phases": 1,
-    "total_tasks": 11,
-    "completed_tasks": 11
+    "completed_phases": 2,
+    "total_tasks": 19,
+    "completed_tasks": 19
   }
 }

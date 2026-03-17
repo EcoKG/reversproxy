@@ -25,6 +25,8 @@ import (
 // mgr may be nil; when non-nil, tunnel management messages (RequestTunnel,
 // OpenConnection) are handled. dataAddr is the address clients should dial
 // for data connections (used in OpenConnection replies).
+// ctrlConns may be nil; when non-nil the client's control connection is
+// registered so the HTTP/HTTPS proxy can send OpenConnection messages.
 func HandleControlConn(
 	ctx context.Context,
 	conn net.Conn,
@@ -33,6 +35,7 @@ func HandleControlConn(
 	log *slog.Logger,
 	mgr *tunnel.Manager,
 	dataAddr string,
+	ctrlConns ...*tunnel.ControlConnRegistry,
 ) {
 	defer conn.Close()
 
@@ -115,10 +118,21 @@ func HandleControlConn(
 		return
 	}
 
+	// Register control connection in ControlConnRegistry if provided.
+	var ccReg *tunnel.ControlConnRegistry
+	if len(ctrlConns) > 0 && ctrlConns[0] != nil {
+		ccReg = ctrlConns[0]
+		ccReg.Register(client.ID, conn)
+	}
+
 	// Ensure cleanup runs regardless of how we exit.
 	defer func() {
 		if mgr != nil {
 			mgr.RemoveTunnelsForClient(client.ID)
+			mgr.RemoveHTTPTunnelsForClient(client.ID)
+		}
+		if ccReg != nil {
+			ccReg.Deregister(client.ID)
 		}
 		reg.Deregister(client.ID)
 		cancel()
@@ -184,10 +198,102 @@ func HandleControlConn(
 			}
 			handleRequestTunnel(clientCtx, env, client, conn, mgr, dataAddr, log)
 
+		case protocol.MsgRequestHTTPTunnel:
+			if mgr == nil {
+				log.Warn("tunnel manager not configured, ignoring RequestHTTPTunnel", "id", client.ID)
+				continue
+			}
+			handleRequestHTTPTunnel(env, client, conn, mgr, dataAddr, log)
+
+		case protocol.MsgRequestHTTPSTunnel:
+			if mgr == nil {
+				log.Warn("tunnel manager not configured, ignoring RequestHTTPSTunnel", "id", client.ID)
+				continue
+			}
+			handleRequestHTTPSTunnel(env, client, conn, mgr, dataAddr, log)
+
 		default:
 			log.Warn("unhandled message type", "id", client.ID, "type", env.Type)
 		}
 	}
+}
+
+// handleRequestHTTPTunnel processes a MsgRequestHTTPTunnel from a client.
+// It registers the hostname in the TunnelManager's HTTP routing table.
+func handleRequestHTTPTunnel(
+	env *protocol.Envelope,
+	client *Client,
+	conn net.Conn,
+	mgr *tunnel.Manager,
+	dataAddr string,
+	log *slog.Logger,
+) {
+	var req protocol.RequestHTTPTunnel
+	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&req); err != nil {
+		log.Warn("failed to decode RequestHTTPTunnel", "id", client.ID, "err", err)
+		_ = protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
+			Status: "error",
+			Error:  "malformed RequestHTTPTunnel payload",
+		})
+		return
+	}
+
+	tunnelID := uuid.New().String()
+	mgr.AddHTTPTunnel(tunnelID, client.ID, req.Hostname, req.LocalHost, req.LocalPort)
+
+	log.Info("HTTP tunnel registered",
+		"tunnelID", tunnelID,
+		"clientID", client.ID,
+		"hostname", req.Hostname,
+		"localHost", req.LocalHost,
+		"localPort", req.LocalPort,
+	)
+
+	_ = protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
+		Hostname:       req.Hostname,
+		TunnelID:       tunnelID,
+		ServerDataAddr: dataAddr,
+		Status:         "ok",
+	})
+}
+
+// handleRequestHTTPSTunnel processes a MsgRequestHTTPSTunnel from a client.
+// It registers the SNI hostname in the TunnelManager's HTTPS routing table.
+func handleRequestHTTPSTunnel(
+	env *protocol.Envelope,
+	client *Client,
+	conn net.Conn,
+	mgr *tunnel.Manager,
+	dataAddr string,
+	log *slog.Logger,
+) {
+	var req protocol.RequestHTTPSTunnel
+	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&req); err != nil {
+		log.Warn("failed to decode RequestHTTPSTunnel", "id", client.ID, "err", err)
+		_ = protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
+			Status: "error",
+			Error:  "malformed RequestHTTPSTunnel payload",
+		})
+		return
+	}
+
+	tunnelID := uuid.New().String()
+	mgr.AddHTTPSTunnel(tunnelID, client.ID, req.Hostname, req.LocalHost, req.LocalPort)
+
+	log.Info("HTTPS tunnel registered",
+		"tunnelID", tunnelID,
+		"clientID", client.ID,
+		"hostname", req.Hostname,
+		"localHost", req.LocalHost,
+		"localPort", req.LocalPort,
+	)
+
+	_ = protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
+		Hostname:       req.Hostname,
+		TunnelID:       tunnelID,
+		ServerDataAddr: dataAddr,
+		Status:         "ok",
+	})
 }
 
 // handleRequestTunnel processes a MsgRequestTunnel from a client.
