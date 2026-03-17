@@ -1,0 +1,53 @@
+{
+  "version": "2.0.0",
+  "created": "2026-03-17T11:35:00Z",
+  "request": "클라이언트와 프록시 서버 간 제어 채널(control connection)을 수립하여 양방향 통신이 가능한 상태를 만든다.",
+  "type": "code",
+  "scale": "medium",
+  "paradigm": "mixed",
+  "language": "go",
+  "state": "planned",
+  "current_step": 4,
+  "current_wave": 0,
+  "phase_context": {
+    "phase_number": 1,
+    "phase_name": "Control Plane 연결",
+    "milestone": 1,
+    "milestone_name": "MVP — 안정적인 리버스 터널 프록시",
+    "requirements": ["REQ-MULTI-01"],
+    "success_criteria": [
+      "클라이언트가 프록시 서버에 연결하면 서버 로그에 클라이언트 등록이 확인된다",
+      "여러 클라이언트가 동시에 프록시 서버에 접속하며 각각 독립적으로 식별된다",
+      "클라이언트 또는 서버를 종료하면 상대측이 연결 해제를 감지한다"
+    ]
+  },
+  "options": {
+    "model": "balanced",
+    "review": "normal",
+    "skip_tests": false
+  },
+  "tasks": {
+    "total": 0,
+    "completed": 0,
+    "completed_tasks": [],
+    "in_progress": 0,
+    "failed": 0,
+    "skipped": 0
+  },
+  "waves": {
+    "total": 0,
+    "current": 0,
+    "completed": []
+  },
+  "revisions": {
+    "plan": 0,
+    "code_minor": 0,
+    "code_major": 0,
+    "reject": 0,
+    "qa_retry": 0
+  },
+  "git": {
+    "branch": null,
+    "commits": []
+  }
+}

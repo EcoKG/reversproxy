@@ -1,0 +1,53 @@
+{
+  "version": "2.1.0",
+  "name": "reversproxy",
+  "description": "Go 기반 고성능 리버스 터널 프록시. 클라이언트가 연결 요청을 대기하고 프록시 서버가 지정된 IP로 연결하여 터널을 구성한다. NAT/방화벽 뒤의 서비스를 외부에서 접근 가능하게 한다.",
+  "created": "2026-03-17T11:30:00Z",
+  "core_value": "높은 동시 접속과 낮은 레이턴시로 트래픽을 터널링하는 고성능 리버스 프록시",
+  "language": "go",
+  "requirements": [
+    {
+      "id": "REQ-TCP-01",
+      "name": "TCP 터널링",
+      "description": "TCP 트래픽을 프록시 서버를 통해 클라이언트로 터널링"
+    },
+    {
+      "id": "REQ-HTTP-01",
+      "name": "HTTP/HTTPS 터널링",
+      "description": "HTTP/HTTPS 요청을 호스트 기반으로 라우팅하여 터널링"
+    },
+    {
+      "id": "REQ-CONN-01",
+      "name": "자동 재연결",
+      "description": "연결 끊김 시 자동으로 재연결 및 세션 복구"
+    },
+    {
+      "id": "REQ-MULTI-01",
+      "name": "다중 클라이언트",
+      "description": "여러 클라이언트가 동시에 프록시 서버에 연결하여 터널 구성"
+    }
+  ],
+  "config": {
+    "mode": "interactive",
+    "granularity": "standard",
+    "model": "balanced",
+    "git_branching": "none",
+    "auto_discuss": true
+  },
+  "current_milestone": 1,
+  "current_phase": 1,
+  "milestones": [
+    {
+      "id": 1,
+      "name": "MVP — 안정적인 리버스 터널 프록시",
+      "phases": [1, 2, 3, 4, 5, 6],
+      "status": "in_progress"
+    }
+  ],
+  "stats": {
+    "total_phases": 6,
+    "completed_phases": 0,
+    "total_tasks": 0,
+    "completed_tasks": 0
+  }
+}

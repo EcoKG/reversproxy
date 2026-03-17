@@ -1,0 +1,12 @@
+{
+  "detected": "2026-03-17",
+  "language": "go",
+  "framework": null,
+  "paradigm": "mixed",
+  "build_tool": "go",
+  "test_tool": "go test",
+  "package_manager": "go modules",
+  "stack": "go",
+  "project_type": "greenfield",
+  "notes": "New reverse tunnel proxy project. No existing code."
+}
