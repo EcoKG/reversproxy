@@ -13,12 +13,20 @@ import (
 // Server configuration
 // -----------------------------------------------------------------------
 
+// ClientTarget describes a single client that the server will dial on startup.
+type ClientTarget struct {
+	// Name is a human-readable label for this client target.
+	Name string `yaml:"name"`
+	// Address is the host:port where the client is listening (e.g. "192.168.1.10:8443").
+	Address string `yaml:"address"`
+	// AuthToken is the pre-shared token sent to this client during handshake.
+	AuthToken string `yaml:"auth_token"`
+}
+
 // ServerConfig holds all server-side configuration values.
 // Values loaded from the YAML file are overridden by command-line flags in
 // the caller; the zero value of each field means "use the default".
 type ServerConfig struct {
-	// Addr is the TLS control-plane listen address (default ":8443").
-	Addr string `yaml:"addr"`
 	// DataAddr is the TCP data-connection listen address (default ":8444").
 	DataAddr string `yaml:"data_addr"`
 	// HTTPAddr is the plain-HTTP proxy listen address (empty = disabled).
@@ -27,7 +35,8 @@ type ServerConfig struct {
 	HTTPSAddr string `yaml:"https_addr"`
 	// AdminAddr is the admin HTTP API listen address (default ":9090").
 	AdminAddr string `yaml:"admin_addr"`
-	// AuthToken is the pre-shared authentication token (default "changeme").
+	// AuthToken is the default pre-shared authentication token (default "changeme").
+	// Used when a ClientTarget does not specify its own token.
 	AuthToken string `yaml:"auth_token"`
 	// CertPath is the path to the TLS certificate file.
 	CertPath string `yaml:"cert_path"`
@@ -35,13 +44,15 @@ type ServerConfig struct {
 	KeyPath string `yaml:"key_path"`
 	// LogLevel controls the verbosity of the logger (debug/info/warn/error).
 	LogLevel string `yaml:"log_level"`
+	// Clients is the list of client addresses the server will dial.
+	// Each entry must have at minimum an Address field.
+	Clients []ClientTarget `yaml:"clients"`
 }
 
 // DefaultServerConfig returns a ServerConfig populated with production-ready
-// defaults matching the pre-Phase 6 flag defaults.
+// defaults.
 func DefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
-		Addr:      ":8443",
 		DataAddr:  ":8444",
 		HTTPAddr:  ":8080",
 		HTTPSAddr: ":8445",
@@ -73,9 +84,10 @@ type TunnelConfig struct {
 
 // ClientConfig holds all client-side configuration values.
 type ClientConfig struct {
-	// ServerAddr is the server control-plane address (default "localhost:8443").
-	ServerAddr string `yaml:"server_addr"`
-	// AuthToken is the pre-shared token sent during registration.
+	// ListenAddr is the address on which the client listens for server connections
+	// (default ":8443").
+	ListenAddr string `yaml:"listen_addr"`
+	// AuthToken is the pre-shared token validated during server handshake.
 	AuthToken string `yaml:"auth_token"`
 	// Name is a human-readable label for this client.
 	Name string `yaml:"name"`
@@ -85,16 +97,22 @@ type ClientConfig struct {
 	Tunnels []TunnelConfig `yaml:"tunnels"`
 	// LogLevel controls the verbosity of the logger (debug/info/warn/error).
 	LogLevel string `yaml:"log_level"`
+	// CertPath is the path to the TLS certificate file for the client listener.
+	CertPath string `yaml:"cert_path"`
+	// KeyPath is the path to the TLS private key file for the client listener.
+	KeyPath string `yaml:"key_path"`
 }
 
 // DefaultClientConfig returns a ClientConfig populated with sensible defaults.
 func DefaultClientConfig() *ClientConfig {
 	return &ClientConfig{
-		ServerAddr: "localhost:8443",
+		ListenAddr: ":8443",
 		AuthToken:  "changeme",
 		Name:       "client1",
 		Insecure:   true,
 		LogLevel:   "info",
+		CertPath:   "client.crt",
+		KeyPath:    "client.key",
 	}
 }
 

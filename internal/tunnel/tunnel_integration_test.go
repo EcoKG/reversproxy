@@ -20,126 +20,173 @@ import (
 )
 
 // ---------------------------------------------------------------------------
-// Test helpers
+// Test helpers — new connection direction
+//
+// In the new architecture:
+//   - The CLIENT listens (TLS) and waits for the SERVER to connect.
+//   - The SERVER dials the client, calls HandleControlConn.
+//
+// In our tests:
+//   - testInfra is the SERVER side: has registry, tunnel manager, data listener,
+//     and a goroutine that dials client listeners.
+//   - connectClient starts a client-side TLS listener, accepts the server
+//     connection, performs the reversed handshake, then optionally requests
+//     a tunnel, and returns everything the test needs.
 // ---------------------------------------------------------------------------
 
-// testInfra holds all the pieces of an in-process test server+client setup.
+// testInfra holds all the pieces of an in-process test server setup.
 type testInfra struct {
 	reg            *control.ClientRegistry
 	mgr            *tunnel.Manager
 	serverDataAddr string
-	controlAddr    string
-	shutdown       func()
+	// dialFn is called by the server to connect to a client listener address.
+	dialFn  func(clientAddr string)
+	shutdown func()
+	ctx      context.Context
+	log      interface{ Info(string, ...any); Error(string, ...any) }
 }
 
 // startInfra creates:
-//   - A TLS control server (control.HandleControlConn)
-//   - A tunnel data listener (tunnel.StartDataListener)
+//   - A tunnel data listener (tunnel.StartDataListener) on the SERVER side.
+//   - A client registry and manager.
+//   - A dialFn that the server uses to connect to a given client address.
 //
 // It returns the testInfra and a shutdown function.
 func startInfra(t *testing.T) *testInfra {
 	t.Helper()
 
-	dir := t.TempDir()
-	cert, err := control.LoadOrGenerateCert(
-		filepath.Join(dir, "server.crt"),
-		filepath.Join(dir, "server.key"),
-	)
-	if err != nil {
-		t.Fatalf("LoadOrGenerateCert: %v", err)
-	}
-
-	tlsCfg := control.NewServerTLSConfig(cert)
-	ln, err := tls.Listen("tcp", "127.0.0.1:0", tlsCfg)
-	if err != nil {
-		t.Fatalf("tls.Listen: %v", err)
-	}
-
-	reg := control.NewClientRegistry()
-	mgr := tunnel.NewManager()
+	reg := tunnel.NewManager()
+	clientReg := control.NewClientRegistry()
 	log := logger.New("test-server")
 
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Start data listener on a random port.
-	if err := tunnel.StartDataListener(ctx, "127.0.0.1:0", mgr, log); err != nil {
+	if err := tunnel.StartDataListener(ctx, "127.0.0.1:0", reg, log); err != nil {
 		cancel()
 		t.Fatalf("StartDataListener: %v", err)
 	}
 	dataAddr := tunnel.DataAddr
 
-	go func() {
-		for {
-			conn, err := ln.Accept()
+	tlsCfg := control.NewClientTLSConfig(true) // server dials with InsecureSkipVerify
+
+	dialFn := func(clientAddr string) {
+		go func() {
+			conn, err := tls.Dial("tcp", clientAddr, tlsCfg)
 			if err != nil {
 				return
 			}
-			go control.HandleControlConn(ctx, conn, reg, "secret", log, mgr, dataAddr)
-		}
-	}()
+			control.HandleControlConn(ctx, conn, clientReg, "secret", log, reg, dataAddr)
+		}()
+	}
 
 	shutdown := func() {
 		cancel()
-		_ = ln.Close()
 	}
 
 	return &testInfra{
-		reg:            reg,
-		mgr:            mgr,
+		reg:            clientReg,
+		mgr:            reg,
 		serverDataAddr: dataAddr,
-		controlAddr:    ln.Addr().String(),
+		dialFn:         dialFn,
 		shutdown:       shutdown,
+		ctx:            ctx,
 	}
 }
 
-// connectClient dials the control server, registers, and optionally requests a
-// tunnel for localHost:localPort (skip if localPort == 0).
-// It returns the open control conn, the assigned client ID, and tunnel info.
+// connectClient starts a TLS client listener, signals the server to dial it,
+// performs the client-side handshake, and optionally requests a tunnel.
+// Returns the open control conn (server side of the pipe from server's perspective,
+// but actually the conn accepted by the client listener), clientID, and tunnelResp.
 func connectClient(
 	t *testing.T,
-	controlAddr string,
+	infra *testInfra,
 	localHost string,
 	localPort int,
 ) (ctrlConn net.Conn, clientID string, tunnelResp protocol.TunnelResp) {
 	t.Helper()
 
-	tlsCfg := control.NewClientTLSConfig(true)
-	conn, err := tls.Dial("tcp", controlAddr, tlsCfg)
+	dir := t.TempDir()
+	cert, err := control.LoadOrGenerateCert(
+		filepath.Join(dir, "client.crt"),
+		filepath.Join(dir, "client.key"),
+	)
 	if err != nil {
-		t.Fatalf("tls.Dial: %v", err)
+		t.Fatalf("LoadOrGenerateCert: %v", err)
 	}
 
-	// Register.
-	if err := protocol.WriteMessage(conn, protocol.MsgClientRegister, protocol.ClientRegister{
-		AuthToken: "secret",
-		Name:      "test-client",
-		Version:   "0.1.0",
-	}); err != nil {
-		conn.Close()
-		t.Fatalf("WriteMessage ClientRegister: %v", err)
+	clientTLSCfg := control.NewServerTLSConfig(cert)
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", clientTLSCfg)
+	if err != nil {
+		t.Fatalf("client tls.Listen: %v", err)
+	}
+	clientAddr := ln.Addr().String()
+
+	// Signal the server to dial this client.
+	infra.dialFn(clientAddr)
+
+	// Accept the server's connection on the client side (with timeout).
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	acCh := make(chan acceptResult, 1)
+	go func() {
+		c, e := ln.Accept()
+		acCh <- acceptResult{c, e}
+	}()
+	time.AfterFunc(5*time.Second, func() { _ = ln.Close() })
+	ar := <-acCh
+	_ = ln.Close() // one-shot; close after accepting.
+	conn, err := ar.conn, ar.err
+	if err != nil {
+		t.Fatalf("client Accept: %v", err)
 	}
 
+	// Client-side handshake: read ClientRegister, validate, send RegisterResp.
 	env, err := protocol.ReadMessage(conn)
 	if err != nil {
 		conn.Close()
-		t.Fatalf("ReadMessage RegisterResp: %v", err)
+		t.Fatalf("read ClientRegister: %v", err)
 	}
-	var regResp protocol.RegisterResp
-	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&regResp); err != nil {
+	if env.Type != protocol.MsgClientRegister {
 		conn.Close()
-		t.Fatalf("decode RegisterResp: %v", err)
+		t.Fatalf("expected MsgClientRegister, got %v", env.Type)
 	}
-	if regResp.Status != "ok" {
+	var reg protocol.ClientRegister
+	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&reg); err != nil {
 		conn.Close()
-		t.Fatalf("registration failed: %s", regResp.Error)
+		t.Fatalf("decode ClientRegister: %v", err)
 	}
-	clientID = regResp.AssignedClientID
+	if reg.AuthToken != "secret" {
+		conn.Close()
+		t.Fatalf("invalid token from server: %q", reg.AuthToken)
+	}
+
+	// Send RegisterResp — include this client's name as ServerID.
+	if err := protocol.WriteMessage(conn, protocol.MsgRegisterResp, protocol.RegisterResp{
+		Status:   "ok",
+		ServerID: "test-client",
+	}); err != nil {
+		conn.Close()
+		t.Fatalf("WriteMessage RegisterResp: %v", err)
+	}
+
+	// Allow server goroutine to process registration.
+	time.Sleep(50 * time.Millisecond)
+
+	// Find the assigned clientID from the server registry.
+	clients := infra.reg.List()
+	if len(clients) > 0 {
+		clientID = clients[len(clients)-1].ID
+	}
 
 	if localPort == 0 {
 		return conn, clientID, protocol.TunnelResp{}
 	}
 
-	// Request tunnel.
+	// Request tunnel by sending RequestTunnel through the client-side conn.
+	// The server's HandleControlConn reads this and creates a public listener.
 	if err := protocol.WriteMessage(conn, protocol.MsgRequestTunnel, protocol.RequestTunnel{
 		LocalHost:     localHost,
 		LocalPort:     localPort,
@@ -206,7 +253,6 @@ func startLocalEcho(t *testing.T, ctx context.Context) int {
 // runClientMessageLoop reads OpenConnection messages from ctrlConn and calls
 // HandleOpenConnection for each one. It runs until ctrlConn is closed.
 func runClientMessageLoop(ctrlConn net.Conn, tunnelDataAddrs map[string]string, log interface{ Error(...interface{}) }) {
-	// Use a simple stderr-based logger substitute; for tests we ignore log.
 	for {
 		env, err := protocol.ReadMessage(ctrlConn)
 		if err != nil {
@@ -244,8 +290,8 @@ func TestSC1_ExternalConnectionReachesLocalService(t *testing.T) {
 	// Start a local echo service.
 	echoPort := startLocalEcho(t, ctx)
 
-	// Connect client and request a tunnel to the echo service.
-	ctrlConn, _, tunnelResp := connectClient(t, infra.controlAddr, "127.0.0.1", echoPort)
+	// Server dials client and client requests a tunnel to the echo service.
+	ctrlConn, _, tunnelResp := connectClient(t, infra, "127.0.0.1", echoPort)
 	defer ctrlConn.Close()
 
 	// Run the client message loop in the background.
@@ -292,7 +338,7 @@ func TestSC2_DataIntegrity(t *testing.T) {
 
 	echoPort := startLocalEcho(t, ctx)
 
-	ctrlConn, _, tunnelResp := connectClient(t, infra.controlAddr, "127.0.0.1", echoPort)
+	ctrlConn, _, tunnelResp := connectClient(t, infra, "127.0.0.1", echoPort)
 	defer ctrlConn.Close()
 
 	tunnelDataAddrs := map[string]string{tunnelResp.TunnelID: tunnelResp.ServerDataAddr}
@@ -347,7 +393,7 @@ func TestSC3_ConcurrentConnections(t *testing.T) {
 
 	echoPort := startLocalEcho(t, ctx)
 
-	ctrlConn, _, tunnelResp := connectClient(t, infra.controlAddr, "127.0.0.1", echoPort)
+	ctrlConn, _, tunnelResp := connectClient(t, infra, "127.0.0.1", echoPort)
 	defer ctrlConn.Close()
 
 	tunnelDataAddrs := map[string]string{tunnelResp.TunnelID: tunnelResp.ServerDataAddr}

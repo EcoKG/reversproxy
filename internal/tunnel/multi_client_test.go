@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"path/filepath"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -47,23 +48,21 @@ func TestSC1_MultiClientIndependentTunnels(t *testing.T) {
 	// Start 1 local HTTP service.
 	httpPort := startLocalHTTP(t, ctx, "sc1-http-response")
 
-	tlsCfg := control.NewClientTLSConfig(true)
-
-	// Connect 3 TCP tunnel clients.
-	conn1, _, tresp1 := mc_connectTCP(t, infra.controlAddr, tlsCfg, "mc-tcp-1", "127.0.0.1", echo1)
+	// Connect 3 TCP tunnel clients (server dials each client listener).
+	conn1, _, tresp1 := mc_connectTCP(t, infra.dialFn, "mc-tcp-1", "127.0.0.1", echo1)
 	defer conn1.Close()
 	go runClientMessageLoop(conn1, map[string]string{tresp1.TunnelID: tresp1.ServerDataAddr}, nil)
 
-	conn2, _, tresp2 := mc_connectTCP(t, infra.controlAddr, tlsCfg, "mc-tcp-2", "127.0.0.1", echo2)
+	conn2, _, tresp2 := mc_connectTCP(t, infra.dialFn, "mc-tcp-2", "127.0.0.1", echo2)
 	defer conn2.Close()
 	go runClientMessageLoop(conn2, map[string]string{tresp2.TunnelID: tresp2.ServerDataAddr}, nil)
 
-	conn3, _, tresp3 := mc_connectTCP(t, infra.controlAddr, tlsCfg, "mc-tcp-3", "127.0.0.1", echo3)
+	conn3, _, tresp3 := mc_connectTCP(t, infra.dialFn, "mc-tcp-3", "127.0.0.1", echo3)
 	defer conn3.Close()
 	go runClientMessageLoop(conn3, map[string]string{tresp3.TunnelID: tresp3.ServerDataAddr}, nil)
 
 	// Connect 1 HTTP tunnel client.
-	connHTTP, hresp := connectHTTPClient(t, infra.controlAddr, "sc1-host.local", "127.0.0.1", httpPort)
+	connHTTP, hresp := connectHTTPClient(t, infra, "sc1-host.local", "127.0.0.1", httpPort)
 	defer connHTTP.Close()
 	go runHTTPClientLoop(connHTTP, map[string]string{hresp.TunnelID: hresp.ServerDataAddr})
 
@@ -118,7 +117,7 @@ func TestSC1_MultiClientHTTPIsolation(t *testing.T) {
 	ctrlConns := make([]net.Conn, len(hosts))
 	for i, h := range hosts {
 		port := startLocalHTTP(t, ctx, bodies[i])
-		conn, hresp := connectHTTPClient(t, infra.controlAddr, h, "127.0.0.1", port)
+		conn, hresp := connectHTTPClient(t, infra, h, "127.0.0.1", port)
 		ctrlConns[i] = conn
 		go runHTTPClientLoop(conn, map[string]string{hresp.TunnelID: hresp.ServerDataAddr})
 	}
@@ -157,16 +156,14 @@ func TestSC2_ClientFailureIsolation(t *testing.T) {
 	echoB := startLocalEcho(t, ctx)
 	echoC := startLocalEcho(t, ctx)
 
-	tlsCfg := control.NewClientTLSConfig(true)
-
-	connA, _, trespA := mc_connectTCP(t, infra.controlAddr, tlsCfg, "iso-A", "127.0.0.1", echoA)
+	connA, _, trespA := mc_connectTCP(t, infra.dialFn, "iso-A", "127.0.0.1", echoA)
 	go runClientMessageLoop(connA, map[string]string{trespA.TunnelID: trespA.ServerDataAddr}, nil)
 
 	// connB is the client we will kill.
-	connB, _, trespB := mc_connectTCP(t, infra.controlAddr, tlsCfg, "iso-B", "127.0.0.1", echoB)
+	connB, _, trespB := mc_connectTCP(t, infra.dialFn, "iso-B", "127.0.0.1", echoB)
 	go runClientMessageLoop(connB, map[string]string{trespB.TunnelID: trespB.ServerDataAddr}, nil)
 
-	connC, _, trespC := mc_connectTCP(t, infra.controlAddr, tlsCfg, "iso-C", "127.0.0.1", echoC)
+	connC, _, trespC := mc_connectTCP(t, infra.dialFn, "iso-C", "127.0.0.1", echoC)
 	go runClientMessageLoop(connC, map[string]string{trespC.TunnelID: trespC.ServerDataAddr}, nil)
 
 	time.Sleep(80 * time.Millisecond)
@@ -245,13 +242,13 @@ func TestSC2_HTTPClientFailureIsolation(t *testing.T) {
 	portB := startLocalHTTP(t, ctx, "http-B-dead")
 	portC := startLocalHTTP(t, ctx, "http-C-alive")
 
-	connA, hrespA := connectHTTPClient(t, infra.controlAddr, "http-a.mc.local", "127.0.0.1", portA)
+	connA, hrespA := connectHTTPClient(t, infra, "http-a.mc.local", "127.0.0.1", portA)
 	go runHTTPClientLoop(connA, map[string]string{hrespA.TunnelID: hrespA.ServerDataAddr})
 
-	connB, hrespB := connectHTTPClient(t, infra.controlAddr, "http-b.mc.local", "127.0.0.1", portB)
+	connB, hrespB := connectHTTPClient(t, infra, "http-b.mc.local", "127.0.0.1", portB)
 	go runHTTPClientLoop(connB, map[string]string{hrespB.TunnelID: hrespB.ServerDataAddr})
 
-	connC, hrespC := connectHTTPClient(t, infra.controlAddr, "http-c.mc.local", "127.0.0.1", portC)
+	connC, hrespC := connectHTTPClient(t, infra, "http-c.mc.local", "127.0.0.1", portC)
 	go runHTTPClientLoop(connC, map[string]string{hrespC.TunnelID: hrespC.ServerDataAddr})
 	_ = hrespC
 
@@ -327,7 +324,6 @@ func TestSC3_ConcurrentLoad(t *testing.T) {
 		publicPort int
 	}
 
-	tlsCfg := control.NewClientTLSConfig(true)
 	slots := make([]tunnelSlot, numClients)
 	ctrlConns := make([]net.Conn, numClients)
 
@@ -335,7 +331,7 @@ func TestSC3_ConcurrentLoad(t *testing.T) {
 		echoPort := startLocalEcho(t, ctx)
 
 		conn, _, tresp := mc_connectTCP(
-			t, infra.controlAddr, tlsCfg,
+			t, infra.dialFn,
 			fmt.Sprintf("load-%d", i),
 			"127.0.0.1", echoPort,
 		)
@@ -435,11 +431,6 @@ func TestSC3_ConcurrentLoad(t *testing.T) {
 
 // TestSC3_ConcurrentHTTPLoad sends concurrent HTTP requests through 3 different
 // HTTP tunnels simultaneously and verifies each response routes correctly.
-//
-// Note: HTTP tunnel concurrency is inherently serialised by the single-goroutine
-// client message loop.  Each OpenConnection is dispatched asynchronously but the
-// overall goroutine budget is kept modest to avoid saturating the test runtime
-// when -count>1 runs multiple instances in the same process.
 func TestSC3_ConcurrentHTTPLoad(t *testing.T) {
 	infra := startHTTPInfra(t)
 	defer infra.shutdown()
@@ -448,8 +439,6 @@ func TestSC3_ConcurrentHTTPLoad(t *testing.T) {
 	defer cancel()
 
 	const numClients = 3
-	// 2 sequential requests per client: enough to prove concurrent multi-client
-	// routing without overwhelming the scheduler under -count=3.
 	const requestsPerClient = 2
 
 	type httpSlot struct {
@@ -465,7 +454,7 @@ func TestSC3_ConcurrentHTTPLoad(t *testing.T) {
 		body := fmt.Sprintf("http-body-%d", i)
 		port := startLocalHTTP(t, ctx, body)
 
-		conn, hresp := connectHTTPClient(t, infra.controlAddr, host, "127.0.0.1", port)
+		conn, hresp := connectHTTPClient(t, infra, host, "127.0.0.1", port)
 		ctrlConns[i] = conn
 		go runHTTPClientLoop(conn, map[string]string{hresp.TunnelID: hresp.ServerDataAddr})
 
@@ -489,7 +478,6 @@ func TestSC3_ConcurrentHTTPLoad(t *testing.T) {
 			wg.Add(1)
 			go func(s httpSlot) {
 				defer wg.Done()
-				// Use the non-fatal helper so goroutines don't call t.Fatalf.
 				got, err := mc_doHTTPRequest(infra.httpAddr, s.host, "/")
 				if err != nil {
 					t.Logf("SC3-HTTP: host %q: request error: %v", s.host, err)
@@ -515,48 +503,81 @@ func TestSC3_ConcurrentHTTPLoad(t *testing.T) {
 // Phase 5 private helpers
 // ---------------------------------------------------------------------------
 
-// mc_connectTCP dials the TLS control server, registers with name, and
-// requests a TCP tunnel to localHost:localPort.
+// mc_connectTCP starts a client-side TLS listener, has the server dial it,
+// performs the reversed handshake, and requests a TCP tunnel to localHost:localPort.
 func mc_connectTCP(
 	t *testing.T,
-	controlAddr string,
-	tlsCfg *tls.Config,
+	dialFn func(string),
 	name, localHost string,
 	localPort int,
 ) (net.Conn, string, protocol.TunnelResp) {
 	t.Helper()
 
-	conn, err := tls.Dial("tcp", controlAddr, tlsCfg)
+	dir := t.TempDir()
+	cert, err := control.LoadOrGenerateCert(
+		filepath.Join(dir, "client.crt"),
+		filepath.Join(dir, "client.key"),
+	)
 	if err != nil {
-		t.Fatalf("mc_connectTCP %q: tls.Dial: %v", name, err)
+		t.Fatalf("mc_connectTCP %q: LoadOrGenerateCert: %v", name, err)
 	}
 
-	if err := protocol.WriteMessage(conn, protocol.MsgClientRegister, protocol.ClientRegister{
-		AuthToken: "secret",
-		Name:      name,
-		Version:   "0.1.0",
-	}); err != nil {
-		conn.Close()
-		t.Fatalf("mc_connectTCP %q: write ClientRegister: %v", name, err)
+	tlsCfg := control.NewServerTLSConfig(cert)
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", tlsCfg)
+	if err != nil {
+		t.Fatalf("mc_connectTCP %q: tls.Listen: %v", name, err)
+	}
+	clientAddr := ln.Addr().String()
+
+	// Server dials the client.
+	dialFn(clientAddr)
+
+	// Accept the server connection (with timeout).
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	acCh := make(chan acceptResult, 1)
+	go func() {
+		c, e := ln.Accept()
+		acCh <- acceptResult{c, e}
+	}()
+	time.AfterFunc(5*time.Second, func() { _ = ln.Close() })
+	ar := <-acCh
+	_ = ln.Close()
+	conn, err := ar.conn, ar.err
+	if err != nil {
+		t.Fatalf("mc_connectTCP %q: Accept: %v", name, err)
 	}
 
+	// Client-side handshake.
 	env, err := protocol.ReadMessage(conn)
 	if err != nil {
 		conn.Close()
-		t.Fatalf("mc_connectTCP %q: read RegisterResp: %v", name, err)
+		t.Fatalf("mc_connectTCP %q: read ClientRegister: %v", name, err)
 	}
-	var regResp protocol.RegisterResp
-	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&regResp); err != nil {
+	if env.Type != protocol.MsgClientRegister {
 		conn.Close()
-		t.Fatalf("mc_connectTCP %q: decode RegisterResp: %v", name, err)
+		t.Fatalf("mc_connectTCP %q: expected MsgClientRegister, got %v", name, env.Type)
 	}
-	if regResp.Status != "ok" {
+	var regMsg protocol.ClientRegister
+	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&regMsg); err != nil {
 		conn.Close()
-		t.Fatalf("mc_connectTCP %q: registration failed: %s", name, regResp.Error)
+		t.Fatalf("mc_connectTCP %q: decode ClientRegister: %v", name, err)
+	}
+	if err := protocol.WriteMessage(conn, protocol.MsgRegisterResp, protocol.RegisterResp{
+		Status:   "ok",
+		ServerID: name,
+	}); err != nil {
+		conn.Close()
+		t.Fatalf("mc_connectTCP %q: write RegisterResp: %v", name, err)
 	}
 
+	// Allow server goroutine to process registration.
+	time.Sleep(50 * time.Millisecond)
+
 	if localPort == 0 {
-		return conn, regResp.AssignedClientID, protocol.TunnelResp{}
+		return conn, "", protocol.TunnelResp{}
 	}
 
 	if err := protocol.WriteMessage(conn, protocol.MsgRequestTunnel, protocol.RequestTunnel{
@@ -587,7 +608,7 @@ func mc_connectTCP(
 		t.Fatalf("mc_connectTCP %q: tunnel request failed: %s", name, tresp.Error)
 	}
 
-	return conn, regResp.AssignedClientID, tresp
+	return conn, "", tresp
 }
 
 // mc_doEchoRoundTrip dials publicPort, sends msg as a full write+CloseWrite,
@@ -633,8 +654,7 @@ func mc_contains(s, sub string) bool {
 }
 
 // mc_doHTTPRequest sends a plain HTTP GET to proxyAddr with the given Host
-// header and returns the raw response string.  Unlike the shared doHTTPRequest
-// helper it does not call t.Fatalf, making it safe to call from goroutines.
+// header and returns the raw response string.
 func mc_doHTTPRequest(proxyAddr, host, path string) (string, error) {
 	conn, err := net.DialTimeout("tcp", proxyAddr, 5*time.Second)
 	if err != nil {
@@ -656,6 +676,5 @@ func mc_doHTTPRequest(proxyAddr, host, path string) (string, error) {
 	return string(raw), nil
 }
 
-// Ensure tunnel package is used (it is via the shared helpers that call
-// tunnel.HandleOpenConnection and tunnel.NewManager etc.).
+// Ensure tunnel package is used.
 var _ = tunnel.NewManager

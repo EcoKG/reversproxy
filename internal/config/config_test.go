@@ -13,9 +13,9 @@ func TestLoadServerConfig_MissingFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error for missing file, got: %v", err)
 	}
-	// Defaults should be populated.
-	if cfg.Addr != ":8443" {
-		t.Errorf("Addr: got %q, want %q", cfg.Addr, ":8443")
+	// Defaults should be populated — Addr field is gone; DataAddr takes its place.
+	if cfg.DataAddr != ":8444" {
+		t.Errorf("DataAddr: got %q, want %q", cfg.DataAddr, ":8444")
 	}
 	if cfg.AuthToken != "changeme" {
 		t.Errorf("AuthToken: got %q, want %q", cfg.AuthToken, "changeme")
@@ -27,10 +27,14 @@ func TestLoadServerConfig_ValidFile(t *testing.T) {
 	path := filepath.Join(dir, "server.yaml")
 
 	content := `
-addr: ":9443"
+data_addr: ":9444"
 auth_token: "supersecret"
 log_level: "debug"
 admin_addr: ":9091"
+clients:
+  - name: "edge-01"
+    address: "10.0.0.1:8443"
+    auth_token: "edge-token"
 `
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("WriteFile: %v", err)
@@ -41,8 +45,8 @@ admin_addr: ":9091"
 		t.Fatalf("LoadServerConfig: %v", err)
 	}
 
-	if cfg.Addr != ":9443" {
-		t.Errorf("Addr: got %q, want %q", cfg.Addr, ":9443")
+	if cfg.DataAddr != ":9444" {
+		t.Errorf("DataAddr: got %q, want %q", cfg.DataAddr, ":9444")
 	}
 	if cfg.AuthToken != "supersecret" {
 		t.Errorf("AuthToken: got %q, want %q", cfg.AuthToken, "supersecret")
@@ -53,9 +57,14 @@ admin_addr: ":9091"
 	if cfg.AdminAddr != ":9091" {
 		t.Errorf("AdminAddr: got %q, want %q", cfg.AdminAddr, ":9091")
 	}
-	// Non-specified field should keep its default.
-	if cfg.DataAddr != ":8444" {
-		t.Errorf("DataAddr: got %q, want %q", cfg.DataAddr, ":8444")
+	if len(cfg.Clients) != 1 {
+		t.Fatalf("Clients: got %d, want 1", len(cfg.Clients))
+	}
+	if cfg.Clients[0].Name != "edge-01" {
+		t.Errorf("Clients[0].Name: got %q, want %q", cfg.Clients[0].Name, "edge-01")
+	}
+	if cfg.Clients[0].Address != "10.0.0.1:8443" {
+		t.Errorf("Clients[0].Address: got %q, want %q", cfg.Clients[0].Address, "10.0.0.1:8443")
 	}
 }
 
@@ -78,8 +87,8 @@ func TestLoadClientConfig_MissingFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("expected no error for missing file, got: %v", err)
 	}
-	if cfg.ServerAddr != "localhost:8443" {
-		t.Errorf("ServerAddr: got %q, want %q", cfg.ServerAddr, "localhost:8443")
+	if cfg.ListenAddr != ":8443" {
+		t.Errorf("ListenAddr: got %q, want %q", cfg.ListenAddr, ":8443")
 	}
 }
 
@@ -88,7 +97,7 @@ func TestLoadClientConfig_ValidFile(t *testing.T) {
 	path := filepath.Join(dir, "client.yaml")
 
 	content := `
-server_addr: "proxy.example.com:8443"
+listen_addr: "0.0.0.0:9443"
 auth_token: "mytoken"
 name: "my-client"
 insecure: false
@@ -112,8 +121,8 @@ tunnels:
 		t.Fatalf("LoadClientConfig: %v", err)
 	}
 
-	if cfg.ServerAddr != "proxy.example.com:8443" {
-		t.Errorf("ServerAddr: got %q, want %q", cfg.ServerAddr, "proxy.example.com:8443")
+	if cfg.ListenAddr != "0.0.0.0:9443" {
+		t.Errorf("ListenAddr: got %q, want %q", cfg.ListenAddr, "0.0.0.0:9443")
 	}
 	if cfg.AuthToken != "mytoken" {
 		t.Errorf("AuthToken: got %q, want %q", cfg.AuthToken, "mytoken")
@@ -140,8 +149,8 @@ tunnels:
 
 func TestDefaultServerConfig(t *testing.T) {
 	cfg := config.DefaultServerConfig()
-	if cfg.Addr == "" {
-		t.Error("DefaultServerConfig: Addr is empty")
+	if cfg.DataAddr == "" {
+		t.Error("DefaultServerConfig: DataAddr is empty")
 	}
 	if cfg.AdminAddr == "" {
 		t.Error("DefaultServerConfig: AdminAddr is empty")
@@ -153,8 +162,8 @@ func TestDefaultServerConfig(t *testing.T) {
 
 func TestDefaultClientConfig(t *testing.T) {
 	cfg := config.DefaultClientConfig()
-	if cfg.ServerAddr == "" {
-		t.Error("DefaultClientConfig: ServerAddr is empty")
+	if cfg.ListenAddr == "" {
+		t.Error("DefaultClientConfig: ListenAddr is empty")
 	}
 	if cfg.Name == "" {
 		t.Error("DefaultClientConfig: Name is empty")

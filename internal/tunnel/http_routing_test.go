@@ -44,34 +44,21 @@ type httpTestInfra struct {
 	mgr            *tunnel.Manager
 	ctrlConns      *tunnel.ControlConnRegistry
 	serverDataAddr string
-	controlAddr    string
-	httpAddr       string
-	httpsAddr      string
-	shutdown       func()
+	// dialFn is the server's dial function — it dials a given client listener.
+	dialFn   func(clientAddr string)
+	httpAddr  string
+	httpsAddr string
+	shutdown  func()
+	ctx       context.Context
 }
 
 // startHTTPInfra starts:
-//   - A TLS control server.
 //   - A data listener.
 //   - An HTTP proxy listener (:0).
 //   - An HTTPS SNI proxy listener (:0).
+//   - A dialFn that the server uses to connect to client listeners.
 func startHTTPInfra(t *testing.T) *httpTestInfra {
 	t.Helper()
-
-	dir := t.TempDir()
-	cert, err := control.LoadOrGenerateCert(
-		filepath.Join(dir, "server.crt"),
-		filepath.Join(dir, "server.key"),
-	)
-	if err != nil {
-		t.Fatalf("LoadOrGenerateCert: %v", err)
-	}
-
-	tlsCfg := control.NewServerTLSConfig(cert)
-	ctrlLn, err := tls.Listen("tcp", "127.0.0.1:0", tlsCfg)
-	if err != nil {
-		t.Fatalf("tls.Listen control: %v", err)
-	}
 
 	reg       := control.NewClientRegistry()
 	mgr       := tunnel.NewManager()
@@ -83,7 +70,6 @@ func startHTTPInfra(t *testing.T) *httpTestInfra {
 	// Data listener.
 	if err := tunnel.StartDataListener(ctx, "127.0.0.1:0", mgr, log); err != nil {
 		cancel()
-		_ = ctrlLn.Close()
 		t.Fatalf("StartDataListener: %v", err)
 	}
 	dataAddr := tunnel.DataAddr
@@ -91,7 +77,6 @@ func startHTTPInfra(t *testing.T) *httpTestInfra {
 	// HTTP proxy.
 	if err := tunnel.StartHTTPProxy(ctx, "127.0.0.1:0", mgr, ctrlConns, dataAddr, log); err != nil {
 		cancel()
-		_ = ctrlLn.Close()
 		t.Fatalf("StartHTTPProxy: %v", err)
 	}
 	httpAddr := tunnel.LastHTTPAddr
@@ -99,25 +84,24 @@ func startHTTPInfra(t *testing.T) *httpTestInfra {
 	// HTTPS SNI proxy.
 	if err := tunnel.StartHTTPSProxy(ctx, "127.0.0.1:0", mgr, ctrlConns, dataAddr, log); err != nil {
 		cancel()
-		_ = ctrlLn.Close()
 		t.Fatalf("StartHTTPSProxy: %v", err)
 	}
 	httpsAddr := tunnel.LastHTTPSAddr
 
-	// Control accept loop.
-	go func() {
-		for {
-			conn, err := ctrlLn.Accept()
+	tlsCfg := control.NewClientTLSConfig(true) // server uses InsecureSkipVerify for self-signed client certs
+
+	dialFn := func(clientAddr string) {
+		go func() {
+			conn, err := tls.Dial("tcp", clientAddr, tlsCfg)
 			if err != nil {
 				return
 			}
-			go control.HandleControlConn(ctx, conn, reg, "secret", log, mgr, dataAddr, ctrlConns)
-		}
-	}()
+			control.HandleControlConn(ctx, conn, reg, "secret", log, mgr, dataAddr, ctrlConns)
+		}()
+	}
 
 	shutdown := func() {
 		cancel()
-		_ = ctrlLn.Close()
 	}
 
 	return &httpTestInfra{
@@ -125,52 +109,26 @@ func startHTTPInfra(t *testing.T) *httpTestInfra {
 		mgr:            mgr,
 		ctrlConns:      ctrlConns,
 		serverDataAddr: dataAddr,
-		controlAddr:    ctrlLn.Addr().String(),
+		dialFn:         dialFn,
 		httpAddr:       httpAddr,
 		httpsAddr:      httpsAddr,
 		shutdown:       shutdown,
+		ctx:            ctx,
 	}
 }
 
-// connectHTTPClient registers a client and requests an HTTP tunnel for hostname.
-// It returns the control connection and the HTTPTunnelResp.
+// connectHTTPClient starts a client TLS listener, has the server dial it,
+// performs the client-side handshake, registers an HTTP tunnel for hostname,
+// and returns the control connection and the HTTPTunnelResp.
 func connectHTTPClient(
 	t *testing.T,
-	controlAddr string,
+	infra *httpTestInfra,
 	hostname, localHost string,
 	localPort int,
 ) (ctrlConn net.Conn, hresp protocol.HTTPTunnelResp) {
 	t.Helper()
 
-	tlsCfg := control.NewClientTLSConfig(true)
-	conn, err := tls.Dial("tcp", controlAddr, tlsCfg)
-	if err != nil {
-		t.Fatalf("tls.Dial: %v", err)
-	}
-
-	if err := protocol.WriteMessage(conn, protocol.MsgClientRegister, protocol.ClientRegister{
-		AuthToken: "secret",
-		Name:      "test-http-client-" + hostname,
-		Version:   "0.1.0",
-	}); err != nil {
-		_ = conn.Close()
-		t.Fatalf("WriteMessage ClientRegister: %v", err)
-	}
-
-	env, err := protocol.ReadMessage(conn)
-	if err != nil {
-		_ = conn.Close()
-		t.Fatalf("ReadMessage RegisterResp: %v", err)
-	}
-	var regResp protocol.RegisterResp
-	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&regResp); err != nil {
-		_ = conn.Close()
-		t.Fatalf("decode RegisterResp: %v", err)
-	}
-	if regResp.Status != "ok" {
-		_ = conn.Close()
-		t.Fatalf("registration failed: %s", regResp.Error)
-	}
+	conn := acceptServerConn(t, infra.dialFn)
 
 	if err := protocol.WriteMessage(conn, protocol.MsgRequestHTTPTunnel, protocol.RequestHTTPTunnel{
 		Hostname:  hostname,
@@ -202,44 +160,17 @@ func connectHTTPClient(
 	return conn, hresp
 }
 
-// connectHTTPSClient registers a client and requests an HTTPS SNI tunnel.
+// connectHTTPSClient starts a client TLS listener, has the server dial it,
+// performs the client-side handshake, registers an HTTPS SNI tunnel.
 func connectHTTPSClient(
 	t *testing.T,
-	controlAddr string,
+	infra *httpTestInfra,
 	hostname, localHost string,
 	localPort int,
 ) (ctrlConn net.Conn, hresp protocol.HTTPTunnelResp) {
 	t.Helper()
 
-	tlsCfg := control.NewClientTLSConfig(true)
-	conn, err := tls.Dial("tcp", controlAddr, tlsCfg)
-	if err != nil {
-		t.Fatalf("tls.Dial: %v", err)
-	}
-
-	if err := protocol.WriteMessage(conn, protocol.MsgClientRegister, protocol.ClientRegister{
-		AuthToken: "secret",
-		Name:      "test-https-client-" + hostname,
-		Version:   "0.1.0",
-	}); err != nil {
-		_ = conn.Close()
-		t.Fatalf("WriteMessage ClientRegister: %v", err)
-	}
-
-	env, err := protocol.ReadMessage(conn)
-	if err != nil {
-		_ = conn.Close()
-		t.Fatalf("ReadMessage RegisterResp: %v", err)
-	}
-	var regResp protocol.RegisterResp
-	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&regResp); err != nil {
-		_ = conn.Close()
-		t.Fatalf("decode RegisterResp: %v", err)
-	}
-	if regResp.Status != "ok" {
-		_ = conn.Close()
-		t.Fatalf("registration failed: %s", regResp.Error)
-	}
+	conn := acceptServerConn(t, infra.dialFn)
 
 	if err := protocol.WriteMessage(conn, protocol.MsgRequestHTTPSTunnel, protocol.RequestHTTPSTunnel{
 		Hostname:  hostname,
@@ -269,6 +200,79 @@ func connectHTTPSClient(
 	}
 
 	return conn, hresp
+}
+
+// acceptServerConn starts a one-shot TLS client listener, signals the server
+// to dial it, performs the reversed handshake, and returns the conn.
+func acceptServerConn(t *testing.T, dialFn func(string)) net.Conn {
+	t.Helper()
+
+	dir := t.TempDir()
+	cert, err := control.LoadOrGenerateCert(
+		filepath.Join(dir, "client.crt"),
+		filepath.Join(dir, "client.key"),
+	)
+	if err != nil {
+		t.Fatalf("LoadOrGenerateCert: %v", err)
+	}
+
+	tlsCfg := control.NewServerTLSConfig(cert)
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", tlsCfg)
+	if err != nil {
+		t.Fatalf("client tls.Listen: %v", err)
+	}
+	clientAddr := ln.Addr().String()
+
+	dialFn(clientAddr)
+
+	type acceptResult struct {
+		conn net.Conn
+		err  error
+	}
+	acCh := make(chan acceptResult, 1)
+	go func() {
+		c, e := ln.Accept()
+		acCh <- acceptResult{c, e}
+	}()
+	time.AfterFunc(5*time.Second, func() { _ = ln.Close() })
+	ar := <-acCh
+	_ = ln.Close()
+	conn, err := ar.conn, ar.err
+	if err != nil {
+		t.Fatalf("client Accept: %v", err)
+	}
+
+	// Client-side handshake.
+	env, err := protocol.ReadMessage(conn)
+	if err != nil {
+		conn.Close()
+		t.Fatalf("read ClientRegister: %v", err)
+	}
+	if env.Type != protocol.MsgClientRegister {
+		conn.Close()
+		t.Fatalf("expected MsgClientRegister, got %v", env.Type)
+	}
+	var reg protocol.ClientRegister
+	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&reg); err != nil {
+		conn.Close()
+		t.Fatalf("decode ClientRegister: %v", err)
+	}
+	if reg.AuthToken != "secret" {
+		conn.Close()
+		t.Fatalf("invalid token: %q", reg.AuthToken)
+	}
+	if err := protocol.WriteMessage(conn, protocol.MsgRegisterResp, protocol.RegisterResp{
+		Status:   "ok",
+		ServerID: "test-http-client",
+	}); err != nil {
+		conn.Close()
+		t.Fatalf("WriteMessage RegisterResp: %v", err)
+	}
+
+	// Allow server goroutine to process registration.
+	time.Sleep(50 * time.Millisecond)
+
+	return conn
 }
 
 // startLocalHTTP starts a minimal HTTP server on a random port.
@@ -422,10 +426,10 @@ func TestSC1_HTTPHostRouting(t *testing.T) {
 	portA := startLocalHTTP(t, ctx, "response-from-A")
 	portB := startLocalHTTP(t, ctx, "response-from-B")
 
-	ctrlA, hrespA := connectHTTPClient(t, infra.controlAddr, "host-a.local", "127.0.0.1", portA)
+	ctrlA, hrespA := connectHTTPClient(t, infra, "host-a.local", "127.0.0.1", portA)
 	defer ctrlA.Close()
 
-	ctrlB, hrespB := connectHTTPClient(t, infra.controlAddr, "host-b.local", "127.0.0.1", portB)
+	ctrlB, hrespB := connectHTTPClient(t, infra, "host-b.local", "127.0.0.1", portB)
 	defer ctrlB.Close()
 
 	addrsA := map[string]string{hrespA.TunnelID: hrespA.ServerDataAddr}
@@ -464,10 +468,10 @@ func TestSC2_HTTPSRoutingBySNI(t *testing.T) {
 	portA, clientTLSA := startLocalTLSEcho(t, ctx, "tls-a.local")
 	portB, clientTLSB := startLocalTLSEcho(t, ctx, "tls-b.local")
 
-	ctrlA, hrespA := connectHTTPSClient(t, infra.controlAddr, "tls-a.local", "127.0.0.1", portA)
+	ctrlA, hrespA := connectHTTPSClient(t, infra, "tls-a.local", "127.0.0.1", portA)
 	defer ctrlA.Close()
 
-	ctrlB, hrespB := connectHTTPSClient(t, infra.controlAddr, "tls-b.local", "127.0.0.1", portB)
+	ctrlB, hrespB := connectHTTPSClient(t, infra, "tls-b.local", "127.0.0.1", portB)
 	defer ctrlB.Close()
 
 	addrsA := map[string]string{hrespA.TunnelID: hrespA.ServerDataAddr}

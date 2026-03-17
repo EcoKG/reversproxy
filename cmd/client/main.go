@@ -25,19 +25,21 @@ func main() {
 	// ------------------------------------------------------------------ //
 	// Flags — config file is loaded first; flags override.
 	// ------------------------------------------------------------------ //
-	configFile := flag.String("config",      "config.yaml",     "path to YAML config file (optional)")
-	server     := flag.String("server",      "",                "server address (overrides config)")
-	token      := flag.String("token",       "",                "pre-shared auth token (overrides config)")
-	name       := flag.String("name",        "",                "client label (overrides config)")
-	insecure   := flag.Bool("insecure",      false,             "skip TLS certificate verification (overrides config)")
-	localHost  := flag.String("local-host",  "127.0.0.1",       "local service hostname to tunnel")
-	localPort  := flag.Int("local-port",     0,                 "local service port to tunnel (0 = no tunnel)")
-	pubPort    := flag.Int("pub-port",       0,                 "requested public port on server (0 = any)")
-	httpHost   := flag.String("http-host",   "",                "hostname to register for HTTP host-based routing")
-	httpPort   := flag.Int("http-port",      0,                 "local port for HTTP routing")
-	httpsHost  := flag.String("https-host",  "",                "hostname to register for HTTPS SNI routing")
-	httpsPort  := flag.Int("https-port",     0,                 "local port for HTTPS routing")
-	logLevel   := flag.String("log-level",   "",                "log level: debug/info/warn/error (overrides config)")
+	configFile := flag.String("config",      "config.yaml",  "path to YAML config file (optional)")
+	listenAddr := flag.String("listen",      "",             "listen address for server connections (overrides config)")
+	token      := flag.String("token",       "",             "pre-shared auth token (overrides config)")
+	name       := flag.String("name",        "",             "client label (overrides config)")
+	insecure   := flag.Bool("insecure",      false,          "skip TLS certificate verification (overrides config)")
+	localHost  := flag.String("local-host",  "127.0.0.1",    "local service hostname to tunnel")
+	localPort  := flag.Int("local-port",     0,              "local service port to tunnel (0 = no tunnel)")
+	pubPort    := flag.Int("pub-port",       0,              "requested public port on server (0 = any)")
+	httpHost   := flag.String("http-host",   "",             "hostname to register for HTTP host-based routing")
+	httpPort   := flag.Int("http-port",      0,              "local port for HTTP routing")
+	httpsHost  := flag.String("https-host",  "",             "hostname to register for HTTPS SNI routing")
+	httpsPort  := flag.Int("https-port",     0,              "local port for HTTPS routing")
+	logLevel   := flag.String("log-level",   "",             "log level: debug/info/warn/error (overrides config)")
+	certFile   := flag.String("cert",        "",             "TLS certificate file path (overrides config)")
+	keyFile    := flag.String("key",         "",             "TLS private key file path (overrides config)")
 	flag.Parse()
 
 	// ------------------------------------------------------------------ //
@@ -45,7 +47,6 @@ func main() {
 	// ------------------------------------------------------------------ //
 	cfg, err := config.LoadClientConfig(*configFile)
 	if err != nil {
-		// Fallback logger for startup errors.
 		tmpLog := logger.New("client")
 		tmpLog.Error("failed to load config file", "path", *configFile, "err", err)
 		return
@@ -53,8 +54,8 @@ func main() {
 
 	flag.Visit(func(f *flag.Flag) {
 		switch f.Name {
-		case "server":
-			cfg.ServerAddr = *server
+		case "listen":
+			cfg.ListenAddr = *listenAddr
 		case "token":
 			cfg.AuthToken = *token
 		case "name":
@@ -63,6 +64,10 @@ func main() {
 			cfg.Insecure = *insecure
 		case "log-level":
 			cfg.LogLevel = *logLevel
+		case "cert":
+			cfg.CertPath = *certFile
+		case "key":
+			cfg.KeyPath = *keyFile
 		}
 	})
 
@@ -96,7 +101,37 @@ func main() {
 		rcCfg.AddHTTPSTunnel(*httpsHost, *localHost, *httpsPort)
 	}
 
-	tlsCfg := control.NewClientTLSConfig(cfg.Insecure)
+	// ------------------------------------------------------------------ //
+	// TLS setup — client now listens; it needs a server certificate.
+	// ------------------------------------------------------------------ //
+	cert, err := control.LoadOrGenerateCert(cfg.CertPath, cfg.KeyPath)
+	if err != nil {
+		log.Error("failed to load or generate TLS certificate", "err", err)
+		return
+	}
+
+	tlsCfg := control.NewServerTLSConfig(cert)
+	if cfg.Insecure {
+		// When insecure mode is enabled, also accept connections without verifying
+		// the server's (dialer's) certificate. This is for dev/testing only.
+		tlsCfg = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS13,
+		}
+	}
+
+	// ------------------------------------------------------------------ //
+	// Start TLS listener — the client waits for server connections.
+	// ------------------------------------------------------------------ //
+	ln, err := tls.Listen("tcp", cfg.ListenAddr, tlsCfg)
+	if err != nil {
+		log.Error("failed to start TLS listener", "addr", cfg.ListenAddr, "err", err)
+		return
+	}
+	defer ln.Close()
+
+	log.Info("client listening for server connections", "addr", ln.Addr().String())
+	fmt.Printf("Client listening on %s — waiting for proxy server to connect\n", ln.Addr().String())
 
 	// ------------------------------------------------------------------ //
 	// Signal handling
@@ -104,98 +139,108 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	backoff := reconnect.NewBackoff()
-
-	serverAddr := cfg.ServerAddr
+	// Close the listener when context is cancelled so Accept() returns.
+	go func() {
+		<-ctx.Done()
+		log.Info("client shutting down")
+		_ = ln.Close()
+	}()
 
 	// ------------------------------------------------------------------ //
-	// Reconnect loop
+	// Accept loop — handle each incoming server connection
 	// ------------------------------------------------------------------ //
 	for {
-		select {
-		case <-ctx.Done():
-			log.Info("client shutting down")
-			return
-		default:
-		}
-
-		log.Info("connecting to server", "server", serverAddr)
-
-		err := connect(ctx, tlsCfg, serverAddr, cfg.AuthToken, cfg.Name, rcCfg, log)
+		conn, err := ln.Accept()
 		if err != nil {
-			if ctx.Err() != nil {
-				log.Info("client shutting down")
-				return
-			}
-
-			delay := backoff.Next()
-			log.Warn("connection failed, will retry",
-				"err", err,
-				"backoff", delay.String(),
-			)
-
 			select {
-			case <-time.After(delay):
 			case <-ctx.Done():
-				log.Info("client shutting down during backoff")
-				return
+				log.Info("listener closed, stopping accept loop")
+			default:
+				log.Error("accept error", "err", err)
 			}
-			continue
+			return
 		}
 
-		log.Info("disconnected cleanly, not reconnecting")
-		return
+		log.Info("server connected", "remote", conn.RemoteAddr())
+
+		// Handle each server connection in its own goroutine.
+		go handleServerConn(ctx, conn, cfg.AuthToken, cfg.Name, rcCfg, log)
 	}
 }
 
-// connect dials the server, performs the registration + tunnel setup, then
-// runs the message loop until the connection is lost or the context is
-// cancelled. It returns nil on a clean (graceful) disconnect and a non-nil
-// error on any unexpected failure so the caller knows whether to retry.
-func connect(
+// handleServerConn manages a single connection from the proxy server.
+// It:
+//  1. Performs the reversed registration handshake (reads ClientRegister from
+//     server, validates the token, sends RegisterResp with the client's name).
+//  2. Re-registers all configured tunnels.
+//  3. Runs the message loop until the connection is lost or ctx is cancelled.
+func handleServerConn(
 	ctx context.Context,
-	tlsCfg *tls.Config,
-	server, token, name string,
+	conn net.Conn,
+	authToken, name string,
 	cfg *reconnect.ClientConfig,
 	log *slog.Logger,
-) error {
-	// ------------------------------------------------------------------ //
-	// Dial
-	// ------------------------------------------------------------------ //
-	dialer := &tls.Dialer{Config: tlsCfg}
-	rawConn, err := dialer.DialContext(ctx, "tcp", server)
-	if err != nil {
-		return fmt.Errorf("dial: %w", err)
-	}
-	conn := rawConn.(net.Conn)
+) {
 	defer conn.Close()
 
 	// ------------------------------------------------------------------ //
-	// Registration handshake
+	// Registration handshake (reversed)
+	// Server sends ClientRegister → client validates → client sends RegisterResp
 	// ------------------------------------------------------------------ //
-	if err := protocol.WriteMessage(conn, protocol.MsgClientRegister, protocol.ClientRegister{
-		AuthToken: token,
-		Name:      name,
-		Version:   "0.1.0",
-	}); err != nil {
-		return fmt.Errorf("send ClientRegister: %w", err)
+
+	// Give the handshake 10 seconds to complete.
+	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+		log.Error("failed to set registration deadline", "err", err)
+		return
 	}
 
 	env, err := protocol.ReadMessage(conn)
 	if err != nil {
-		return fmt.Errorf("read RegisterResp: %w", err)
+		log.Warn("failed to read registration message from server", "err", err)
+		return
 	}
 
-	var resp protocol.RegisterResp
-	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&resp); err != nil {
-		return fmt.Errorf("decode RegisterResp: %w", err)
+	if env.Type != protocol.MsgClientRegister {
+		log.Warn("unexpected message type during handshake", "type", env.Type)
+		return
 	}
 
-	if resp.Status != "ok" {
-		return fmt.Errorf("registration rejected: %s", resp.Error)
+	var msg protocol.ClientRegister
+	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&msg); err != nil {
+		log.Warn("failed to decode ClientRegister from server", "err", err)
+		_ = protocol.WriteMessage(conn, protocol.MsgRegisterResp, protocol.RegisterResp{
+			Status: "error",
+			Error:  "malformed ClientRegister payload",
+		})
+		return
 	}
 
-	log.Info("registered", "client_id", resp.AssignedClientID)
+	if msg.AuthToken != authToken {
+		_ = protocol.WriteMessage(conn, protocol.MsgRegisterResp, protocol.RegisterResp{
+			Status: "error",
+			Error:  "invalid token",
+		})
+		log.Warn("registration rejected: invalid token from server", "remote", conn.RemoteAddr())
+		return
+	}
+
+	// Send RegisterResp with the client's name in ServerID so the server knows
+	// which client it has connected to.
+	if err := protocol.WriteMessage(conn, protocol.MsgRegisterResp, protocol.RegisterResp{
+		Status:   "ok",
+		ServerID: name, // client's name carried in ServerID field
+	}); err != nil {
+		log.Error("failed to send RegisterResp", "err", err)
+		return
+	}
+
+	log.Info("registered with server", "remote", conn.RemoteAddr(), "client_name", name)
+
+	// Remove the registration deadline.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		log.Error("failed to clear deadline", "err", err)
+		return
+	}
 
 	// ------------------------------------------------------------------ //
 	// Re-register all tunnels
@@ -209,24 +254,29 @@ func connect(
 			RequestedPort: tc.RequestedPort,
 		}
 		if err := protocol.WriteMessage(conn, protocol.MsgRequestTunnel, req); err != nil {
-			return fmt.Errorf("send RequestTunnel: %w", err)
+			log.Warn("send RequestTunnel failed", "err", err)
+			return
 		}
 
 		tenv, err := protocol.ReadMessage(conn)
 		if err != nil {
-			return fmt.Errorf("read TunnelResp: %w", err)
+			log.Warn("read TunnelResp failed", "err", err)
+			return
 		}
 		if tenv.Type != protocol.MsgTunnelResp {
-			return fmt.Errorf("expected TunnelResp, got %v", tenv.Type)
+			log.Warn("expected TunnelResp", "got", tenv.Type)
+			return
 		}
 
 		var tresp protocol.TunnelResp
 		if err := gob.NewDecoder(bytes.NewReader(tenv.Payload)).Decode(&tresp); err != nil {
-			return fmt.Errorf("decode TunnelResp: %w", err)
+			log.Warn("decode TunnelResp failed", "err", err)
+			return
 		}
 
 		if tresp.Status != "ok" {
-			return fmt.Errorf("tunnel request failed: %s", tresp.Error)
+			log.Warn("tunnel request failed", "err", tresp.Error)
+			return
 		}
 
 		tunnelDataAddrs[tresp.TunnelID] = tresp.ServerDataAddr
@@ -246,24 +296,29 @@ func connect(
 			LocalPort: hc.LocalPort,
 		}
 		if err := protocol.WriteMessage(conn, protocol.MsgRequestHTTPTunnel, req); err != nil {
-			return fmt.Errorf("send RequestHTTPTunnel: %w", err)
+			log.Warn("send RequestHTTPTunnel failed", "err", err)
+			return
 		}
 
 		henv, err := protocol.ReadMessage(conn)
 		if err != nil {
-			return fmt.Errorf("read HTTPTunnelResp: %w", err)
+			log.Warn("read HTTPTunnelResp failed", "err", err)
+			return
 		}
 		if henv.Type != protocol.MsgHTTPTunnelResp {
-			return fmt.Errorf("expected MsgHTTPTunnelResp, got %v", henv.Type)
+			log.Warn("expected MsgHTTPTunnelResp", "got", henv.Type)
+			return
 		}
 
 		var hresp protocol.HTTPTunnelResp
 		if err := gob.NewDecoder(bytes.NewReader(henv.Payload)).Decode(&hresp); err != nil {
-			return fmt.Errorf("decode HTTPTunnelResp: %w", err)
+			log.Warn("decode HTTPTunnelResp failed", "err", err)
+			return
 		}
 
 		if hresp.Status != "ok" {
-			return fmt.Errorf("HTTP tunnel request failed: %s", hresp.Error)
+			log.Warn("HTTP tunnel request failed", "err", hresp.Error)
+			return
 		}
 
 		tunnelDataAddrs[hresp.TunnelID] = hresp.ServerDataAddr
@@ -283,24 +338,29 @@ func connect(
 			LocalPort: hc.LocalPort,
 		}
 		if err := protocol.WriteMessage(conn, protocol.MsgRequestHTTPSTunnel, req); err != nil {
-			return fmt.Errorf("send RequestHTTPSTunnel: %w", err)
+			log.Warn("send RequestHTTPSTunnel failed", "err", err)
+			return
 		}
 
 		henv, err := protocol.ReadMessage(conn)
 		if err != nil {
-			return fmt.Errorf("read HTTPTunnelResp (HTTPS): %w", err)
+			log.Warn("read HTTPTunnelResp (HTTPS) failed", "err", err)
+			return
 		}
 		if henv.Type != protocol.MsgHTTPTunnelResp {
-			return fmt.Errorf("expected MsgHTTPTunnelResp, got %v", henv.Type)
+			log.Warn("expected MsgHTTPTunnelResp (HTTPS)", "got", henv.Type)
+			return
 		}
 
 		var hresp protocol.HTTPTunnelResp
 		if err := gob.NewDecoder(bytes.NewReader(henv.Payload)).Decode(&hresp); err != nil {
-			return fmt.Errorf("decode HTTPTunnelResp (HTTPS): %w", err)
+			log.Warn("decode HTTPTunnelResp (HTTPS) failed", "err", err)
+			return
 		}
 
 		if hresp.Status != "ok" {
-			return fmt.Errorf("HTTPS tunnel request failed: %s", hresp.Error)
+			log.Warn("HTTPS tunnel request failed", "err", hresp.Error)
+			return
 		}
 
 		tunnelDataAddrs[hresp.TunnelID] = hresp.ServerDataAddr
@@ -335,16 +395,17 @@ func connect(
 	for {
 		select {
 		case <-ctx.Done():
-			return nil
+			return
 		default:
 		}
 
 		env, err := protocol.ReadMessage(conn)
 		if err != nil {
 			if ctx.Err() != nil {
-				return nil
+				return
 			}
-			return fmt.Errorf("connection lost: %w", err)
+			log.Warn("connection to server lost", "err", err)
+			return
 		}
 
 		switch env.Type {
@@ -356,9 +417,10 @@ func connect(
 			}
 			if err := protocol.WriteMessage(conn, protocol.MsgPong, protocol.Pong{Seq: ping.Seq}); err != nil {
 				if ctx.Err() != nil {
-					return nil
+					return
 				}
-				return fmt.Errorf("send Pong: %w", err)
+				log.Warn("send Pong failed", "err", err)
+				return
 			}
 			log.Debug("pong sent", "seq", ping.Seq)
 
@@ -370,7 +432,7 @@ func connect(
 				log.Info("server requested disconnect", "reason", disc.Reason)
 			}
 			_ = protocol.WriteMessage(conn, protocol.MsgDisconnectAck, protocol.DisconnectAck{})
-			return nil
+			return
 
 		case protocol.MsgOpenConnection:
 			var openConn protocol.OpenConnection

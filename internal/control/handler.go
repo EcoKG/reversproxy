@@ -19,6 +19,11 @@ import (
 // HandleControlConn manages the lifecycle of a single control-plane connection:
 // registration handshake → message loop → cleanup.
 //
+// In the new architecture the SERVER dials the CLIENT. HandleControlConn is
+// called by the server after dialing; it sends a ClientRegister message to
+// identify and authenticate itself, and then waits for the client's
+// RegisterResp before entering the message loop.
+//
 // It blocks until the connection is closed, the parent context is cancelled,
 // or the client sends a Disconnect message.
 //
@@ -47,45 +52,48 @@ func HandleControlConn(
 
 	// ------------------------------------------------------------------ //
 	// Registration phase
+	//
+	// New flow: SERVER sends ClientRegister → CLIENT validates → CLIENT sends RegisterResp.
+	// HandleControlConn runs on the server side, so we SEND the register message
+	// and then READ the response.
 	// ------------------------------------------------------------------ //
 
-	// Give the client 10 seconds to send ClientRegister.
+	// Give the handshake 10 seconds to complete.
 	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		log.Error("failed to set registration deadline", "err", err)
 		return
 	}
 
-	env, err := protocol.ReadMessage(conn)
-	if err != nil {
-		log.Warn("failed to read registration message", "err", err)
+	// Server sends its identity and auth token to the client.
+	if err := protocol.WriteMessage(conn, protocol.MsgClientRegister, protocol.ClientRegister{
+		AuthToken: authToken,
+		Name:      "server",
+		Version:   "0.1.0",
+	}); err != nil {
+		log.Warn("failed to send ClientRegister to client", "err", err)
 		return
 	}
 
-	if env.Type != protocol.MsgClientRegister {
-		_ = protocol.WriteMessage(conn, protocol.MsgRegisterResp, protocol.RegisterResp{
-			Status: "error",
-			Error:  "expected ClientRegister",
-		})
+	// Wait for the client's acknowledgement.
+	env, err := protocol.ReadMessage(conn)
+	if err != nil {
+		log.Warn("failed to read RegisterResp from client", "err", err)
+		return
+	}
+
+	if env.Type != protocol.MsgRegisterResp {
 		log.Warn("unexpected message type during registration", "type", env.Type)
 		return
 	}
 
-	var msg protocol.ClientRegister
-	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&msg); err != nil {
-		_ = protocol.WriteMessage(conn, protocol.MsgRegisterResp, protocol.RegisterResp{
-			Status: "error",
-			Error:  "malformed ClientRegister payload",
-		})
-		log.Warn("failed to decode ClientRegister", "err", err)
+	var resp protocol.RegisterResp
+	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&resp); err != nil {
+		log.Warn("failed to decode RegisterResp from client", "err", err)
 		return
 	}
 
-	if msg.AuthToken != authToken {
-		_ = protocol.WriteMessage(conn, protocol.MsgRegisterResp, protocol.RegisterResp{
-			Status: "error",
-			Error:  "invalid token",
-		})
-		log.Warn("registration rejected: invalid token", "addr", conn.RemoteAddr())
+	if resp.Status != "ok" {
+		log.Warn("client rejected registration", "error", resp.Error, "addr", conn.RemoteAddr())
 		return
 	}
 
@@ -93,16 +101,14 @@ func HandleControlConn(
 	// cancelled independently of the server root context.
 	clientCtx, cancel := context.WithCancel(ctx)
 
-	client := reg.Register(msg.Name, conn.RemoteAddr().String(), conn, cancel)
-
-	if err := protocol.WriteMessage(conn, protocol.MsgRegisterResp, protocol.RegisterResp{
-		AssignedClientID: client.ID,
-		Status:           "ok",
-	}); err != nil {
-		cancel()
-		log.Error("failed to send RegisterResp", "err", err)
-		return
+	// Use the name returned by the client in the RegisterResp (ServerID field
+	// carries the client's chosen name), falling back to the remote address.
+	clientName := resp.ServerID
+	if clientName == "" {
+		clientName = conn.RemoteAddr().String()
 	}
+
+	client := reg.Register(clientName, conn.RemoteAddr().String(), conn, cancel)
 
 	log.Info("client registered",
 		"id", client.ID,
