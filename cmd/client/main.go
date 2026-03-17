@@ -39,9 +39,10 @@ func main() {
 	httpPort   := flag.Int("http-port",      0,              "local port for HTTP routing")
 	httpsHost  := flag.String("https-host",  "",             "hostname to register for HTTPS SNI routing")
 	httpsPort  := flag.Int("https-port",     0,              "local port for HTTPS routing")
-	socksAddr  := flag.String("socks-addr",  "",             "local SOCKS5 listener address (overrides config; empty = use config default)")
-	socksUser  := flag.String("socks-user",  "",             "SOCKS5 auth username (overrides config; empty = no auth)")
-	socksPass  := flag.String("socks-pass",  "",             "SOCKS5 auth password (overrides config; empty = no auth)")
+	socksAddr     := flag.String("socks-addr",       "",             "local SOCKS5 listener address (overrides config; empty = use config default)")
+	socksUser     := flag.String("socks-user",       "",             "SOCKS5 auth username (overrides config; empty = no auth)")
+	socksPass     := flag.String("socks-pass",       "",             "SOCKS5 auth password (overrides config; empty = no auth)")
+	httpProxyAddr := flag.String("http-proxy-addr",  "",             "local HTTP CONNECT proxy address (overrides config; empty = use config default)")
 	logLevel   := flag.String("log-level",   "",             "log level: debug/info/warn/error (overrides config)")
 	certFile   := flag.String("cert",        "",             "TLS certificate file path (overrides config)")
 	keyFile    := flag.String("key",         "",             "TLS private key file path (overrides config)")
@@ -79,6 +80,8 @@ func main() {
 			cfg.SOCKSUser = *socksUser
 		case "socks-pass":
 			cfg.SOCKSPass = *socksPass
+		case "http-proxy-addr":
+			cfg.HTTPProxyAddr = *httpProxyAddr
 		}
 	})
 
@@ -175,7 +178,7 @@ func main() {
 		log.Info("server connected", "remote", conn.RemoteAddr())
 
 		// Handle each server connection in its own goroutine.
-		go handleServerConn(ctx, conn, cfg.AuthToken, cfg.Name, rcCfg, cfg.SOCKSAddr, cfg.SOCKSUser, cfg.SOCKSPass, log)
+		go handleServerConn(ctx, conn, cfg.AuthToken, cfg.Name, rcCfg, cfg.SOCKSAddr, cfg.SOCKSUser, cfg.SOCKSPass, cfg.HTTPProxyAddr, log)
 	}
 }
 
@@ -185,13 +188,15 @@ func main() {
 //     server, validates the token, sends RegisterResp with the client's name).
 //  2. Re-registers all configured tunnels.
 //  3. Starts the local SOCKS5 listener (if socksAddr != "").
-//  4. Runs the message loop until the connection is lost or ctx is cancelled.
+//  4. Starts the local HTTP CONNECT proxy listener (if httpProxyAddr != "").
+//  5. Runs the message loop until the connection is lost or ctx is cancelled.
 func handleServerConn(
 	ctx context.Context,
 	conn net.Conn,
 	authToken, name string,
 	cfg *reconnect.ClientConfig,
 	socksAddr, socksUser, socksPass string,
+	httpProxyAddr string,
 	log *slog.Logger,
 ) {
 	defer conn.Close()
@@ -419,7 +424,20 @@ func handleServerConn(
 			log.Error("failed to start client SOCKS5 proxy", "addr", socksAddr, "err", err)
 			// Non-fatal: continue running even without SOCKS5.
 		} else {
-			fmt.Printf("SOCKS5 proxy: socks5://127.0.0.1%s (use HTTPS_PROXY or ALL_PROXY)\n", socks.LastClientSOCKSAddr)
+			fmt.Printf("SOCKS5 proxy: socks5://127.0.0.1%s (use ALL_PROXY)\n", socks.LastClientSOCKSAddr)
+		}
+	}
+
+	if httpProxyAddr != "" {
+		httpCtx, httpCancel := context.WithCancel(ctx)
+		defer httpCancel()
+
+		if err := socks.StartHTTPConnectProxy(httpCtx, httpProxyAddr, sharedWriter, clientMux, log); err != nil {
+			log.Error("failed to start HTTP CONNECT proxy", "addr", httpProxyAddr, "err", err)
+			// Non-fatal: continue running even without HTTP proxy.
+		} else {
+			fmt.Printf("HTTP CONNECT proxy: http://%s (use HTTPS_PROXY=http://%s)\n",
+				socks.LastClientHTTPProxyAddr, socks.LastClientHTTPProxyAddr)
 		}
 	}
 

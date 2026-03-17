@@ -115,19 +115,27 @@ type ClientConfig struct {
 	SOCKSUser string `yaml:"socks_user"`
 	// SOCKSPass is the password for SOCKS5 authentication (empty = no auth).
 	SOCKSPass string `yaml:"socks_pass"`
+
+	// HTTP CONNECT proxy (reversed architecture — listener is on the CLIENT side).
+
+	// HTTPProxyAddr is the local address on which the client runs the HTTP CONNECT
+	// proxy listener (default ":8080").  Set to "" to disable.
+	// Use HTTPS_PROXY=http://127.0.0.1:8080 to route traffic through this proxy.
+	HTTPProxyAddr string `yaml:"http_proxy_addr"`
 }
 
 // DefaultClientConfig returns a ClientConfig populated with sensible defaults.
 func DefaultClientConfig() *ClientConfig {
 	return &ClientConfig{
-		ListenAddr: ":8443",
-		AuthToken:  "changeme",
-		Name:       "client1",
-		Insecure:   true,
-		LogLevel:   "info",
-		CertPath:   "client.crt",
-		KeyPath:    "client.key",
-		SOCKSAddr:  ":1080",
+		ListenAddr:    ":8443",
+		AuthToken:     "changeme",
+		Name:          "client1",
+		Insecure:      true,
+		LogLevel:      "info",
+		CertPath:      "client.crt",
+		KeyPath:       "client.key",
+		SOCKSAddr:     ":1080",
+		HTTPProxyAddr: ":8080",
 	}
 }
 
