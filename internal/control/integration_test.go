@@ -48,7 +48,7 @@ func startTestServer(t *testing.T, token string) (addr string, reg *control.Clie
 				// Listener closed — normal shutdown.
 				return
 			}
-			go control.HandleControlConn(ctx, conn, reg, token, log)
+			go control.HandleControlConn(ctx, conn, reg, token, log, nil, "")
 		}
 	}()
 

@@ -14,16 +14,18 @@ import (
 	"github.com/starlyn/reversproxy/internal/control"
 	"github.com/starlyn/reversproxy/internal/logger"
 	"github.com/starlyn/reversproxy/internal/protocol"
+	"github.com/starlyn/reversproxy/internal/tunnel"
 )
 
 func main() {
 	// ------------------------------------------------------------------ //
 	// Flags
 	// ------------------------------------------------------------------ //
-	addr     := flag.String("addr",  ":8443",      "TLS listen address")
-	token    := flag.String("token", "changeme",   "pre-shared auth token")
-	certFile := flag.String("cert",  "server.crt", "TLS certificate file path")
-	keyFile  := flag.String("key",   "server.key", "TLS private key file path")
+	addr     := flag.String("addr",      ":8443",      "TLS control listen address")
+	dataAddr := flag.String("data-addr", ":8444",      "TCP data connection listen address")
+	token    := flag.String("token",     "changeme",   "pre-shared auth token")
+	certFile := flag.String("cert",      "server.crt", "TLS certificate file path")
+	keyFile  := flag.String("key",       "server.key", "TLS private key file path")
 	flag.Parse()
 
 	// ------------------------------------------------------------------ //
@@ -48,15 +50,25 @@ func main() {
 		os.Exit(1)
 	}
 
-	log.Info("server listening", "addr", *addr)
+	log.Info("control server listening", "addr", *addr)
 
 	// ------------------------------------------------------------------ //
-	// Registry and root context
+	// Registry, tunnel manager, and root context
 	// ------------------------------------------------------------------ //
 	reg := control.NewClientRegistry()
+	mgr := tunnel.NewManager()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start the data connection listener.
+	if err := tunnel.StartDataListener(ctx, *dataAddr, mgr, log); err != nil {
+		log.Error("failed to start data listener", "addr", *dataAddr, "err", err)
+		os.Exit(1)
+	}
+
+	// dataAddr may have been :0 (OS-assigned); use the actual bound address.
+	resolvedDataAddr := tunnel.DataAddr
 
 	// ------------------------------------------------------------------ //
 	// Graceful shutdown signal handler
@@ -103,7 +115,7 @@ func main() {
 		wg.Add(1)
 		go func(c net.Conn) {
 			defer wg.Done()
-			control.HandleControlConn(ctx, c, reg, *token, log)
+			control.HandleControlConn(ctx, c, reg, *token, log, mgr, resolvedDataAddr)
 		}(conn)
 	}
 
