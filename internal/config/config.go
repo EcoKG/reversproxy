@@ -33,6 +33,12 @@ type ServerConfig struct {
 	HTTPAddr string `yaml:"http_addr"`
 	// HTTPSAddr is the HTTPS/SNI proxy listen address (empty = disabled).
 	HTTPSAddr string `yaml:"https_addr"`
+	// SOCKSAddr is the SOCKS5 proxy listen address (empty = disabled, default ":1080").
+	SOCKSAddr string `yaml:"socks_addr"`
+	// SOCKSUser is the username for SOCKS5 authentication (empty = no auth).
+	SOCKSUser string `yaml:"socks_user"`
+	// SOCKSPass is the password for SOCKS5 authentication (empty = no auth).
+	SOCKSPass string `yaml:"socks_pass"`
 	// AdminAddr is the admin HTTP API listen address (default ":9090").
 	AdminAddr string `yaml:"admin_addr"`
 	// AuthToken is the default pre-shared authentication token (default "changeme").
@@ -56,6 +62,7 @@ func DefaultServerConfig() *ServerConfig {
 		DataAddr:  ":8444",
 		HTTPAddr:  ":8080",
 		HTTPSAddr: ":8445",
+		SOCKSAddr: ":1080",
 		AdminAddr: ":9090",
 		AuthToken: "changeme",
 		CertPath:  "server.crt",

@@ -218,9 +218,35 @@ func HandleControlConn(
 			}
 			handleRequestHTTPSTunnel(env, client, conn, mgr, dataAddr, log)
 
+		case protocol.MsgSOCKSReady:
+			if mgr == nil {
+				log.Warn("tunnel manager not configured, ignoring MsgSOCKSReady", "id", client.ID)
+				continue
+			}
+			handleSOCKSReady(env, client, mgr, log)
+
 		default:
 			log.Warn("unhandled message type", "id", client.ID, "type", env.Type)
 		}
+	}
+}
+
+// handleSOCKSReady processes a MsgSOCKSReady message from a client.
+// It forwards the dial result to the SOCKS5 handler waiting on the pending slot.
+func handleSOCKSReady(
+	env *protocol.Envelope,
+	client *Client,
+	mgr *tunnel.Manager,
+	log *slog.Logger,
+) {
+	var ready protocol.SOCKSReady
+	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&ready); err != nil {
+		log.Warn("failed to decode SOCKSReady", "id", client.ID, "err", err)
+		return
+	}
+
+	if err := mgr.FulfillSOCKS(ready.ConnID, ready.Success, ready.Error); err != nil {
+		log.Warn("FulfillSOCKS failed", "id", client.ID, "connID", ready.ConnID, "err", err)
 	}
 }
 

@@ -9,6 +9,111 @@ import (
 	"github.com/EcoKG/reversproxy/internal/protocol"
 )
 
+// HandleSOCKSConnect is called by the client message loop when a MsgSOCKSConnect
+// message arrives from the server. It:
+//  1. Dials the target host:port (DNS resolution happens here, on the client side).
+//  2. Opens a data connection back to the server and sends DataConnHello.
+//  3. Sends MsgSOCKSReady back on the control connection indicating success/failure.
+//  4. If successful, relays data bidirectionally between the data conn and the target.
+//
+// All network work is done in a goroutine; the function returns immediately.
+func HandleSOCKSConnect(
+	msg protocol.SOCKSConnect,
+	ctrlConn net.Conn,
+	serverDataAddr string,
+	log *slog.Logger,
+) {
+	log = log.With("connID", msg.ConnID, "target", fmt.Sprintf("%s:%d", msg.TargetHost, msg.TargetPort))
+
+	go func() {
+		if err := handleSOCKSConnectAsync(msg, ctrlConn, serverDataAddr, log); err != nil {
+			log.Error("SOCKS connect handler failed", "err", err)
+		}
+	}()
+}
+
+func handleSOCKSConnectAsync(
+	msg protocol.SOCKSConnect,
+	ctrlConn net.Conn,
+	serverDataAddr string,
+	log *slog.Logger,
+) error {
+	targetAddr := fmt.Sprintf("%s:%d", msg.TargetHost, msg.TargetPort)
+
+	// 1. Dial the target (DNS resolution happens here on the client side).
+	targetConn, err := net.Dial("tcp", targetAddr)
+	if err != nil {
+		log.Warn("SOCKS: failed to dial target", "target", targetAddr, "err", err)
+		// Report failure to server via control channel.
+		_ = protocol.WriteMessage(ctrlConn, protocol.MsgSOCKSReady, protocol.SOCKSReady{
+			ConnID:  msg.ConnID,
+			Success: false,
+			Error:   err.Error(),
+		})
+		return nil // not a fatal error for the goroutine
+	}
+	defer targetConn.Close()
+
+	// 2. Open a data connection back to the server.
+	dataConn, err := net.Dial("tcp", serverDataAddr)
+	if err != nil {
+		_ = protocol.WriteMessage(ctrlConn, protocol.MsgSOCKSReady, protocol.SOCKSReady{
+			ConnID:  msg.ConnID,
+			Success: false,
+			Error:   fmt.Sprintf("dial server data addr: %v", err),
+		})
+		return nil
+	}
+	defer dataConn.Close()
+
+	// 3. Identify this data connection to the server.
+	if err := protocol.WriteMessage(dataConn, protocol.MsgDataConnHello, protocol.DataConnHello{
+		ConnID: msg.ConnID,
+	}); err != nil {
+		_ = protocol.WriteMessage(ctrlConn, protocol.MsgSOCKSReady, protocol.SOCKSReady{
+			ConnID:  msg.ConnID,
+			Success: false,
+			Error:   fmt.Sprintf("send DataConnHello: %v", err),
+		})
+		return nil
+	}
+
+	// 4. Tell the server the dial succeeded.
+	if err := protocol.WriteMessage(ctrlConn, protocol.MsgSOCKSReady, protocol.SOCKSReady{
+		ConnID:  msg.ConnID,
+		Success: true,
+	}); err != nil {
+		return fmt.Errorf("send SOCKSReady: %w", err)
+	}
+
+	log.Info("SOCKS relay started (client side)", "target", targetAddr)
+
+	// 5. Bidirectional relay between target and server data connection.
+	done := make(chan struct{}, 2)
+
+	go func() {
+		_, _ = io.Copy(targetConn, dataConn)
+		if tc, ok := targetConn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		done <- struct{}{}
+	}()
+
+	go func() {
+		_, _ = io.Copy(dataConn, targetConn)
+		if tc, ok := dataConn.(*net.TCPConn); ok {
+			_ = tc.CloseWrite()
+		}
+		done <- struct{}{}
+	}()
+
+	<-done
+	<-done
+
+	log.Info("SOCKS relay finished (client side)")
+	return nil
+}
+
 // HandleOpenConnection is called by the client message loop when an
 // OpenConnection message arrives from the server. It:
 //  1. Dials the server's data address.

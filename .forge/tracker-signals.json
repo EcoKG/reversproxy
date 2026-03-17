@@ -6,5 +6,109 @@
       "output": ""
     },
     "timestamp": "2026-03-17T15:28:05.028Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "server.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T15:40:57.145Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "ctrl_registry.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T15:41:07.021Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "client.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T15:41:24.686Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "manager.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T15:41:44.970Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "manager.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T15:41:54.121Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "handler.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T15:43:06.954Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "main.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T15:43:25.431Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "main.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T15:44:46.670Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "main.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T15:44:56.434Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "main.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T15:45:03.195Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "server_test.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T15:46:41.409Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "server_test.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T15:47:10.488Z"
+  },
+  {
+    "type": "typecheck_fail",
+    "data": {
+      "file": "server_test.go",
+      "output": ""
+    },
+    "timestamp": "2026-03-17T15:48:25.075Z"
   }
 ]

@@ -18,6 +18,7 @@ import (
 	"github.com/EcoKG/reversproxy/internal/logger"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/reconnect"
+	"github.com/EcoKG/reversproxy/internal/socks"
 	"github.com/EcoKG/reversproxy/internal/stats"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
@@ -31,6 +32,9 @@ func main() {
 	dataAddr   := flag.String("data-addr",   "",            "TCP data connection listen address (overrides config)")
 	httpAddr   := flag.String("http-addr",   "",            "HTTP host-based proxy listen address (overrides config)")
 	httpsAddr  := flag.String("https-addr",  "",            "HTTPS SNI-routing proxy listen address (overrides config)")
+	socksAddr  := flag.String("socks-addr",  "",            "SOCKS5 proxy listen address (overrides config; empty disables)")
+	socksUser  := flag.String("socks-user",  "",            "SOCKS5 auth username (overrides config; empty = no auth)")
+	socksPass  := flag.String("socks-pass",  "",            "SOCKS5 auth password (overrides config; empty = no auth)")
 	adminAddr  := flag.String("admin-addr",  "",            "Admin HTTP API listen address (overrides config)")
 	token      := flag.String("token",       "",            "default pre-shared auth token (overrides config)")
 	certFile   := flag.String("cert",        "",            "TLS certificate file path (overrides config)")
@@ -57,6 +61,12 @@ func main() {
 			cfg.HTTPAddr = *httpAddr
 		case "https-addr":
 			cfg.HTTPSAddr = *httpsAddr
+		case "socks-addr":
+			cfg.SOCKSAddr = *socksAddr
+		case "socks-user":
+			cfg.SOCKSUser = *socksUser
+		case "socks-pass":
+			cfg.SOCKSPass = *socksPass
 		case "admin-addr":
 			cfg.AdminAddr = *adminAddr
 		case "token":
@@ -127,6 +137,14 @@ func main() {
 	if cfg.HTTPSAddr != "" {
 		if err := tunnel.StartHTTPSProxy(ctx, cfg.HTTPSAddr, mgr, ctrlConns, resolvedDataAddr, log); err != nil {
 			log.Error("failed to start HTTPS proxy", "addr", cfg.HTTPSAddr, "err", err)
+			os.Exit(1)
+		}
+	}
+
+	// Start the SOCKS5 proxy.
+	if cfg.SOCKSAddr != "" {
+		if err := socks.StartSOCKSProxy(ctx, cfg.SOCKSAddr, mgr, ctrlConns, resolvedDataAddr, log, cfg.SOCKSUser, cfg.SOCKSPass); err != nil {
+			log.Error("failed to start SOCKS5 proxy", "addr", cfg.SOCKSAddr, "err", err)
 			os.Exit(1)
 		}
 	}

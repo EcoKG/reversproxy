@@ -21,6 +21,10 @@ const (
 	MsgRequestHTTPTunnel  MsgType = 11 // client → server: register a hostname for HTTP routing
 	MsgRequestHTTPSTunnel MsgType = 12 // client → server: register a hostname for HTTPS/SNI routing
 	MsgHTTPTunnelResp     MsgType = 13 // server → client: HTTP/HTTPS tunnel registration result
+
+	// SOCKS5 proxy messages (Phase 4).
+	MsgSOCKSConnect MsgType = 14 // server → client: dial target host:port on behalf of a SOCKS5 client
+	MsgSOCKSReady   MsgType = 15 // client → server: result of the dial attempt
 )
 
 // MaxMessageSize is the maximum allowed byte length of a framed message.
@@ -155,6 +159,32 @@ type HTTPTunnelResp struct {
 	ServerDataAddr string
 	// Status is "ok" on success and "error" on failure.
 	Status string
+	// Error is a human-readable failure description (empty on success).
+	Error string
+}
+
+// SOCKSConnect is sent by the server to the client when a SOCKS5 user
+// issues a CONNECT request. The client must dial TargetHost:TargetPort,
+// open a data connection back to the server, and then relay data.
+// DNS resolution happens on the client side; the domain name is forwarded
+// verbatim rather than pre-resolved on the server.
+type SOCKSConnect struct {
+	// ConnID uniquely identifies this SOCKS5 connection.
+	ConnID string
+	// TargetHost is the hostname or IP address to connect to.
+	TargetHost string
+	// TargetPort is the destination port.
+	TargetPort int
+}
+
+// SOCKSReady is sent by the client back to the server after it has dialled
+// the target. Success indicates whether the dial succeeded. On failure,
+// Error carries a human-readable description.
+type SOCKSReady struct {
+	// ConnID matches the ConnID from the corresponding SOCKSConnect.
+	ConnID string
+	// Success is true when the client successfully connected to the target.
+	Success bool
 	// Error is a human-readable failure description (empty on success).
 	Error string
 }

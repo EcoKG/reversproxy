@@ -44,3 +44,15 @@ func (r *ControlConnRegistry) Get(clientID string) (net.Conn, bool) {
 	r.mu.RUnlock()
 	return conn, ok
 }
+
+// PickAny returns the control connection of an arbitrary connected client,
+// or (nil, false) if no clients are connected. It is used by the SOCKS5
+// proxy to route connections through any available client.
+func (r *ControlConnRegistry) PickAny() (net.Conn, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	for _, conn := range r.conns {
+		return conn, true
+	}
+	return nil, false
+}

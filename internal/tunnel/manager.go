@@ -9,9 +9,19 @@ import (
 // pendingConn holds the external user's net.Conn while waiting for the client
 // to dial back with a matching data connection.
 type pendingConn struct {
-	extConn net.Conn
-	ready   chan struct{} // closed when dataConn is filled
+	extConn  net.Conn
+	ready    chan struct{} // closed when dataConn is filled
 	dataConn net.Conn
+}
+
+// pendingSOCKS holds state for an in-progress SOCKS5 CONNECT request.
+// The server creates one of these while waiting for the client to dial the
+// target and report back via MsgSOCKSReady.
+type pendingSOCKS struct {
+	// ready is closed (by FulfillSOCKS) once the client has reported the dial result.
+	ready   chan struct{}
+	success bool
+	errMsg  string
 }
 
 // TunnelEntry describes a single registered tunnel.
@@ -40,14 +50,15 @@ type HTTPTunnelEntry struct {
 // Manager tracks all active tunnels and pending data connections.
 // It is safe for concurrent use.
 type Manager struct {
-	mu          sync.RWMutex
-	tunnels     map[string]*TunnelEntry     // tunnelID → entry
-	byClient    map[string][]string         // clientID → []tunnelID
-	pending     map[string]*pendingConn     // connID → pendingConn
-	httpTunnels map[string]*HTTPTunnelEntry // hostname → HTTPTunnelEntry (plain HTTP)
-	httpsTunnels map[string]*HTTPTunnelEntry // hostname → HTTPTunnelEntry (HTTPS/SNI)
-	httpByClient map[string][]string        // clientID → []hostname (HTTP)
-	httpsByClient map[string][]string       // clientID → []hostname (HTTPS)
+	mu            sync.RWMutex
+	tunnels       map[string]*TunnelEntry     // tunnelID → entry
+	byClient      map[string][]string         // clientID → []tunnelID
+	pending       map[string]*pendingConn     // connID → pendingConn
+	pendingSocks  map[string]*pendingSOCKS    // connID → pendingSOCKS
+	httpTunnels   map[string]*HTTPTunnelEntry // hostname → HTTPTunnelEntry (plain HTTP)
+	httpsTunnels  map[string]*HTTPTunnelEntry // hostname → HTTPTunnelEntry (HTTPS/SNI)
+	httpByClient  map[string][]string         // clientID → []hostname (HTTP)
+	httpsByClient map[string][]string         // clientID → []hostname (HTTPS)
 }
 
 // NewManager returns an initialised Manager.
@@ -56,6 +67,7 @@ func NewManager() *Manager {
 		tunnels:       make(map[string]*TunnelEntry),
 		byClient:      make(map[string][]string),
 		pending:       make(map[string]*pendingConn),
+		pendingSocks:  make(map[string]*pendingSOCKS),
 		httpTunnels:   make(map[string]*HTTPTunnelEntry),
 		httpsTunnels:  make(map[string]*HTTPTunnelEntry),
 		httpByClient:  make(map[string][]string),
@@ -242,4 +254,43 @@ func (m *Manager) RemoveHTTPTunnelsForClient(clientID string) {
 		delete(m.httpsTunnels, h)
 	}
 	delete(m.httpsByClient, clientID)
+}
+
+// RegisterPendingSOCKS stores a pending SOCKS5 connection under connID and
+// returns the pendingSOCKS so the caller can wait for the client's result.
+func (m *Manager) RegisterPendingSOCKS(connID string) *pendingSOCKS {
+	p := &pendingSOCKS{
+		ready: make(chan struct{}),
+	}
+	m.mu.Lock()
+	m.pendingSocks[connID] = p
+	m.mu.Unlock()
+	return p
+}
+
+// FulfillSOCKS records the result of a client's dial attempt for a SOCKS5
+// connection. Returns an error if connID is unknown.
+func (m *Manager) FulfillSOCKS(connID string, success bool, errMsg string) error {
+	m.mu.Lock()
+	p, ok := m.pendingSocks[connID]
+	if ok {
+		delete(m.pendingSocks, connID)
+	}
+	m.mu.Unlock()
+
+	if !ok {
+		return fmt.Errorf("tunnel manager: unknown SOCKS connID %q", connID)
+	}
+
+	p.success = success
+	p.errMsg = errMsg
+	close(p.ready)
+	return nil
+}
+
+// WaitSOCKSReady blocks until the client reports the result of the dial.
+// Returns (true, "") on success or (false, errMsg) on failure.
+func WaitSOCKSReady(p *pendingSOCKS) (bool, string) {
+	<-p.ready
+	return p.success, p.errMsg
 }

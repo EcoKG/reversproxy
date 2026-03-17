@@ -246,6 +246,7 @@ func handleServerConn(
 	// Re-register all tunnels
 	// ------------------------------------------------------------------ //
 	tunnelDataAddrs := make(map[string]string)
+	var serverDataAddr string // first data addr learned from any tunnel registration
 
 	for _, tc := range cfg.Tunnels {
 		req := protocol.RequestTunnel{
@@ -280,6 +281,9 @@ func handleServerConn(
 		}
 
 		tunnelDataAddrs[tresp.TunnelID] = tresp.ServerDataAddr
+		if serverDataAddr == "" {
+			serverDataAddr = tresp.ServerDataAddr
+		}
 		log.Info("tunnel established",
 			"tunnelID", tresp.TunnelID,
 			"publicPort", tresp.PublicPort,
@@ -322,6 +326,9 @@ func handleServerConn(
 		}
 
 		tunnelDataAddrs[hresp.TunnelID] = hresp.ServerDataAddr
+		if serverDataAddr == "" {
+			serverDataAddr = hresp.ServerDataAddr
+		}
 		log.Info("HTTP tunnel registered",
 			"hostname", hresp.Hostname,
 			"tunnelID", hresp.TunnelID,
@@ -364,6 +371,9 @@ func handleServerConn(
 		}
 
 		tunnelDataAddrs[hresp.TunnelID] = hresp.ServerDataAddr
+		if serverDataAddr == "" {
+			serverDataAddr = hresp.ServerDataAddr
+		}
 		log.Info("HTTPS tunnel registered",
 			"hostname", hresp.Hostname,
 			"tunnelID", hresp.TunnelID,
@@ -449,6 +459,25 @@ func handleServerConn(
 				continue
 			}
 			tunnel.HandleOpenConnection(openConn, dataAddr, log)
+
+		case protocol.MsgSOCKSConnect:
+			var socksConn protocol.SOCKSConnect
+			if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&socksConn); err != nil {
+				log.Warn("failed to decode SOCKSConnect", "err", err)
+				continue
+			}
+			if serverDataAddr == "" {
+				log.Warn("received SOCKSConnect but server data addr is unknown",
+					"connID", socksConn.ConnID,
+				)
+				_ = protocol.WriteMessage(conn, protocol.MsgSOCKSReady, protocol.SOCKSReady{
+					ConnID:  socksConn.ConnID,
+					Success: false,
+					Error:   "client: server data addr unknown",
+				})
+				continue
+			}
+			tunnel.HandleSOCKSConnect(socksConn, conn, serverDataAddr, log)
 
 		default:
 			log.Warn("unhandled message type", "type", env.Type)
