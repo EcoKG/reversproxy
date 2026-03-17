@@ -35,19 +35,19 @@
     "auto_discuss": true
   },
   "current_milestone": 1,
-  "current_phase": 5,
+  "current_phase": 6,
   "milestones": [
     {
       "id": 1,
       "name": "MVP — 안정적인 리버스 터널 프록시",
       "phases": [1, 2, 3, 4, 5, 6],
-      "status": "in_progress"
+      "status": "completed"
     }
   ],
   "stats": {
     "total_phases": 6,
-    "completed_phases": 4,
-    "total_tasks": 33,
-    "completed_tasks": 33
+    "completed_phases": 6,
+    "total_tasks": 47,
+    "completed_tasks": 47
   }
 }
