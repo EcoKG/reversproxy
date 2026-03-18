@@ -2,96 +2,89 @@
 set -e
 
 REPO="EcoKG/reversproxy"
-VERSION="${1:-latest}"
-INSTALL_DIR="/usr/local/bin"
-CONFIG_DIR="/etc/reversproxy"
-SERVICE_USER="reversproxy"
+INSTALL_DIR="$HOME/reversproxy"
+BIN="$INSTALL_DIR/reversproxy-client"
 
-# Detect architecture
+echo "==> reversproxy-client installer"
+
+# Detect arch
 ARCH=$(uname -m)
 case "$ARCH" in
   x86_64)  ARCH="amd64" ;;
   aarch64) ARCH="arm64" ;;
-  armv7l)  ARCH="arm" ;;
-  *) echo "Unsupported architecture: $ARCH"; exit 1 ;;
+  *) echo "Unsupported: $ARCH"; exit 1 ;;
 esac
 
-echo "==> reversproxy client installer"
-echo "    OS: linux / Arch: $ARCH"
+# Download
+URL="https://github.com/$REPO/releases/latest/download/reversproxy-client-linux-$ARCH"
+mkdir -p "$INSTALL_DIR"
+echo "==> Downloading $URL"
+curl -fsSL -o "$BIN" "$URL"
+chmod +x "$BIN"
 
-# Get download URL
-if [ "$VERSION" = "latest" ]; then
-  URL="https://github.com/$REPO/releases/latest/download/reversproxy-client-linux-$ARCH"
-else
-  URL="https://github.com/$REPO/releases/download/$VERSION/reversproxy-client-linux-$ARCH"
+# Create run script
+cat > "$INSTALL_DIR/rproxy" << 'SCRIPT'
+#!/bin/bash
+DIR="$HOME/reversproxy"
+BIN="$DIR/reversproxy-client"
+PID="$DIR/.pid"
+LOG="$DIR/client.log"
+
+# ── 설정 ──────────────────────────
+LISTEN=":8443"
+TOKEN="changeme"
+NAME="$(hostname)"
+LOCAL_PORT=80
+SOCKS=":1080"
+HTTP_PROXY=":8080"
+# ──────────────────────────────────
+
+case "${1:-start}" in
+  start)
+    pkill -9 -f reversproxy-client 2>/dev/null; rm -f "$PID"
+    nohup "$BIN" --listen "$LISTEN" --token "$TOKEN" --name "$NAME" \
+      --local-port "$LOCAL_PORT" --socks-addr "$SOCKS" \
+      --http-proxy-addr "$HTTP_PROXY" >> "$LOG" 2>&1 &
+    echo $! > "$PID"; sleep 2
+    if kill -0 "$(cat "$PID")" 2>/dev/null; then
+      echo "reversproxy started (PID: $(cat "$PID"))"
+      echo "  SOCKS5: socks5h://127.0.0.1${SOCKS}"
+      echo "  HTTP:   http://127.0.0.1${HTTP_PROXY}"
+      echo "  Claude: HTTPS_PROXY=http://127.0.0.1${HTTP_PROXY} claude"
+    else
+      echo "Failed"; tail -5 "$LOG"; exit 1
+    fi ;;
+  stop)
+    pkill -9 -f reversproxy-client 2>/dev/null; rm -f "$PID"
+    echo "Stopped" ;;
+  status)
+    [ -f "$PID" ] && kill -0 "$(cat "$PID")" 2>/dev/null && echo "Running ($(cat "$PID"))" || echo "Not running" ;;
+  logs)
+    tail -f "$LOG" ;;
+  restart)
+    "$0" stop; sleep 1; "$0" start ;;
+  *)
+    echo "Usage: rproxy {start|stop|status|logs|restart}" ;;
+esac
+SCRIPT
+chmod +x "$INSTALL_DIR/rproxy"
+
+# Add to PATH
+if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
+  for RC in "$HOME/.bashrc" "$HOME/.zshrc"; do
+    [ -f "$RC" ] && ! grep -q "reversproxy" "$RC" && echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$RC"
+  done
+  export PATH="$INSTALL_DIR:$PATH"
 fi
 
-# Download binary
-echo "==> Downloading from $URL"
-curl -fsSL -o /tmp/reversproxy-client "$URL"
-chmod +x /tmp/reversproxy-client
-
-# Install binary
-echo "==> Installing to $INSTALL_DIR/reversproxy-client"
-sudo mv /tmp/reversproxy-client "$INSTALL_DIR/reversproxy-client"
-
-# Create config directory
-sudo mkdir -p "$CONFIG_DIR"
-
-# Create default config if not exists
-if [ ! -f "$CONFIG_DIR/client.yaml" ]; then
-  echo "==> Creating default config at $CONFIG_DIR/client.yaml"
-  sudo tee "$CONFIG_DIR/client.yaml" > /dev/null <<'YAML'
-# reversproxy client configuration
-listen_addr: ":8443"
-auth_token: "changeme"
-name: "client1"
-log_level: "info"
-cert_path: "/etc/reversproxy/client.crt"
-key_path: "/etc/reversproxy/client.key"
-
-# Tunnels to register when server connects
-tunnels:
-  - type: tcp
-    local_host: "127.0.0.1"
-    local_port: 80
-    requested_port: 9000
-  # - type: http
-  #   hostname: "myapp.example.com"
-  #   local_host: "127.0.0.1"
-  #   local_port: 8080
-YAML
-fi
-
-# Create systemd service
-echo "==> Installing systemd service"
-sudo tee /etc/systemd/system/reversproxy-client.service > /dev/null <<'UNIT'
-[Unit]
-Description=ReverseProxy Tunnel Client
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-ExecStart=/usr/local/bin/reversproxy-client --config /etc/reversproxy/client.yaml
-Restart=always
-RestartSec=5
-LimitNOFILE=65536
-StandardOutput=journal
-StandardError=journal
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-
-sudo systemctl daemon-reload
-sudo systemctl enable reversproxy-client
-
 echo ""
-echo "==> Installation complete!"
+echo "==> Done!"
 echo ""
-echo "    1. Edit config:  sudo nano /etc/reversproxy/client.yaml"
-echo "    2. Start:        sudo systemctl start reversproxy-client"
-echo "    3. Status:       sudo systemctl status reversproxy-client"
-echo "    4. Logs:         journalctl -u reversproxy-client -f"
+echo "  rproxy              # 시작"
+echo "  rproxy stop         # 종료"
+echo "  rproxy restart      # 재시작"
+echo "  rproxy status       # 상태"
+echo "  rproxy logs         # 로그"
+echo ""
+echo "  source ~/.bashrc    # PATH 적용 (최초 1회)"
 echo ""
