@@ -161,6 +161,31 @@ func main() {
 	}()
 
 	// ------------------------------------------------------------------ //
+	// Persistent SOCKS5 / HTTP CONNECT proxies
+	//
+	// These are started ONCE and survive server reconnections. The
+	// sharedWriter's underlying connection is swapped on each reconnect.
+	// ------------------------------------------------------------------ //
+	sharedWriter := &clientConnWriter{}
+	clientMux := tunnel.NewSOCKSMux()
+
+	if cfg.SOCKSAddr != "" {
+		if err := socks.StartClientSOCKSProxy(ctx, cfg.SOCKSAddr, sharedWriter, clientMux, log, cfg.SOCKSUser, cfg.SOCKSPass); err != nil {
+			log.Error("failed to start client SOCKS5 proxy", "addr", cfg.SOCKSAddr, "err", err)
+		} else {
+			fmt.Printf("SOCKS5 proxy: socks5://127.0.0.1%s\n", socks.LastClientSOCKSAddr)
+		}
+	}
+
+	if cfg.HTTPProxyAddr != "" {
+		if err := socks.StartHTTPConnectProxy(ctx, cfg.HTTPProxyAddr, sharedWriter, clientMux, log); err != nil {
+			log.Error("failed to start HTTP CONNECT proxy", "addr", cfg.HTTPProxyAddr, "err", err)
+		} else {
+			fmt.Printf("HTTP CONNECT proxy: http://%s (use HTTPS_PROXY)\n", socks.LastClientHTTPProxyAddr)
+		}
+	}
+
+	// ------------------------------------------------------------------ //
 	// Accept loop — handle each incoming server connection
 	// ------------------------------------------------------------------ //
 	for {
@@ -177,26 +202,34 @@ func main() {
 
 		log.Info("server connected", "remote", conn.RemoteAddr())
 
-		// Handle each server connection in its own goroutine.
-		go handleServerConn(ctx, conn, cfg.AuthToken, cfg.Name, rcCfg, cfg.SOCKSAddr, cfg.SOCKSUser, cfg.SOCKSPass, cfg.HTTPProxyAddr, log)
+		// Swap the writer to the new connection and clear stale mux channels.
+		sharedWriter.SwapConn(conn)
+		clientMux.CloseAll()
+
+		// Handle this connection (blocks until lost).
+		handleServerConn(ctx, conn, cfg.AuthToken, cfg.Name, rcCfg, sharedWriter, clientMux, log)
+
+		// Connection lost — clear writer so SOCKS/HTTP return 502 instead of writing to dead conn.
+		sharedWriter.ClearConn()
+		log.Warn("server connection lost, waiting for reconnect")
 	}
 }
 
 // handleServerConn manages a single connection from the proxy server.
 // It:
-//  1. Performs the reversed registration handshake (reads ClientRegister from
-//     server, validates the token, sends RegisterResp with the client's name).
+//  1. Performs the reversed registration handshake.
 //  2. Re-registers all configured tunnels.
-//  3. Starts the local SOCKS5 listener (if socksAddr != "").
-//  4. Starts the local HTTP CONNECT proxy listener (if httpProxyAddr != "").
-//  5. Runs the message loop until the connection is lost or ctx is cancelled.
+//  3. Runs the message loop until the connection is lost or ctx is cancelled.
+//
+// The SOCKS5/HTTP CONNECT proxies are started once in main() and share the
+// swappable sharedWriter and clientMux passed here.
 func handleServerConn(
 	ctx context.Context,
 	conn net.Conn,
 	authToken, name string,
 	cfg *reconnect.ClientConfig,
-	socksAddr, socksUser, socksPass string,
-	httpProxyAddr string,
+	sharedWriter *clientConnWriter,
+	clientMux *tunnel.SOCKSMux,
 	log *slog.Logger,
 ) {
 	defer conn.Close()
@@ -401,64 +434,19 @@ func handleServerConn(
 	}
 
 	// ------------------------------------------------------------------ //
-	// Client-side SOCKS5 proxy (reversed architecture)
-	//
-	// Now that we have a live control connection, start the local SOCKS5
-	// listener.  All CONNECT requests will be forwarded to the server (which
-	// has internet access) via MsgSOCKSConnect/MsgSOCKSData/MsgSOCKSClose.
+	// Graceful shutdown for this connection
 	// ------------------------------------------------------------------ //
+	connCtx, connCancel := context.WithCancel(ctx)
+	defer connCancel()
 
-	// clientMux dispatches inbound MsgSOCKSReady / MsgSOCKSData / MsgSOCKSClose
-	// frames to the correct channel goroutine started by the SOCKS listener.
-	clientMux := tunnel.NewSOCKSMux()
-
-	// sharedWriter serialises all writes to conn from both the SOCKS listener
-	// goroutines and the main message-loop (Pong, DisconnectAck, etc.).
-	sharedWriter := &clientConnWriter{conn: conn}
-
-	if socksAddr != "" {
-		socksCtx, socksCancel := context.WithCancel(ctx)
-		defer socksCancel()
-
-		if err := socks.StartClientSOCKSProxy(socksCtx, socksAddr, sharedWriter, clientMux, log, socksUser, socksPass); err != nil {
-			log.Error("failed to start client SOCKS5 proxy", "addr", socksAddr, "err", err)
-			// Non-fatal: continue running even without SOCKS5.
-		} else {
-			fmt.Printf("SOCKS5 proxy: socks5://127.0.0.1%s (use ALL_PROXY)\n", socks.LastClientSOCKSAddr)
-		}
-	}
-
-	if httpProxyAddr != "" {
-		httpCtx, httpCancel := context.WithCancel(ctx)
-		defer httpCancel()
-
-		if err := socks.StartHTTPConnectProxy(httpCtx, httpProxyAddr, sharedWriter, clientMux, log); err != nil {
-			log.Error("failed to start HTTP CONNECT proxy", "addr", httpProxyAddr, "err", err)
-			// Non-fatal: continue running even without HTTP proxy.
-		} else {
-			fmt.Printf("HTTP CONNECT proxy: http://%s (use HTTPS_PROXY=http://%s)\n",
-				socks.LastClientHTTPProxyAddr, socks.LastClientHTTPProxyAddr)
-		}
-	}
-
-	// ------------------------------------------------------------------ //
-	// Graceful shutdown goroutine
-	// ------------------------------------------------------------------ //
-	shutdownDone := make(chan struct{})
 	go func() {
-		defer close(shutdownDone)
-		<-ctx.Done()
-
-		log.Info("signal received, sending disconnect")
-		_ = sharedWriter.WriteMsg(protocol.MsgDisconnect, protocol.Disconnect{Reason: "client shutdown"})
-
+		<-connCtx.Done()
+		if ctx.Err() != nil {
+			// Global shutdown — send disconnect
+			log.Info("signal received, sending disconnect")
+			_ = sharedWriter.WriteMsg(protocol.MsgDisconnect, protocol.Disconnect{Reason: "client shutdown"})
+		}
 		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
-		_, _ = protocol.ReadMessage(conn)
-		conn.Close()
-	}()
-	defer func() {
-		clientMux.CloseAll()
-		<-shutdownDone
 	}()
 
 	// ------------------------------------------------------------------ //
@@ -562,6 +550,7 @@ func handleServerConn(
 // clientConnWriter wraps a net.Conn with a mutex so that all writes from
 // concurrent goroutines (SOCKS relay goroutines + message loop) are serialised.
 // It implements socks.ControlWriter.
+// The underlying connection can be swapped via SwapConn when the server reconnects.
 type clientConnWriter struct {
 	mu   sync.Mutex
 	conn net.Conn
@@ -570,5 +559,22 @@ type clientConnWriter struct {
 func (w *clientConnWriter) WriteMsg(msgType protocol.MsgType, payload any) error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	if w.conn == nil {
+		return fmt.Errorf("no active control connection")
+	}
 	return protocol.WriteMessage(w.conn, msgType, payload)
+}
+
+// SwapConn replaces the underlying connection (called on server reconnect).
+func (w *clientConnWriter) SwapConn(c net.Conn) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.conn = c
+}
+
+// ClearConn sets the connection to nil (called when connection is lost).
+func (w *clientConnWriter) ClearConn() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.conn = nil
 }
