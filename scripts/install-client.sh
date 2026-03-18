@@ -69,22 +69,32 @@ esac
 SCRIPT
 chmod +x "$INSTALL_DIR/rproxy"
 
-# Add to PATH
-if ! echo "$PATH" | grep -q "$INSTALL_DIR"; then
-  for RC in "$HOME/.bashrc" "$HOME/.zshrc"; do
-    [ -f "$RC" ] && ! grep -q "reversproxy" "$RC" && echo "export PATH=\"$INSTALL_DIR:\$PATH\"" >> "$RC"
-  done
-  export PATH="$INSTALL_DIR:$PATH"
-fi
+# Add to PATH + proxy env
+for RC in "$HOME/.bashrc" "$HOME/.zshrc"; do
+  [ -f "$RC" ] || continue
+  if ! grep -q "# reversproxy" "$RC"; then
+    cat >> "$RC" << 'RCBLOCK'
+
+# reversproxy
+export PATH="$HOME/reversproxy:$PATH"
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY
+export HTTPS_PROXY=http://127.0.0.1:8080
+export HTTP_PROXY=http://127.0.0.1:8080
+export ALL_PROXY=socks5h://127.0.0.1:1080
+export NO_PROXY=localhost,127.0.0.1
+RCBLOCK
+  fi
+done
+export PATH="$INSTALL_DIR:$PATH"
 
 echo ""
 echo "==> Done!"
 echo ""
+echo "  source ~/.bashrc    # 환경변수 적용 (최초 1회)"
 echo "  rproxy              # 시작"
 echo "  rproxy stop         # 종료"
-echo "  rproxy restart      # 재시작"
-echo "  rproxy status       # 상태"
-echo "  rproxy logs         # 로그"
 echo ""
-echo "  source ~/.bashrc    # PATH 적용 (최초 1회)"
+echo "  모든 인터넷 접속이 프록시를 통합니다."
+echo "  Claude: claude"
+echo "  curl:   curl https://httpbin.org/ip"
 echo ""
