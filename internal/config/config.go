@@ -122,6 +122,23 @@ type ClientConfig struct {
 	// proxy listener (default ":8080").  Set to "" to disable.
 	// Use HTTPS_PROXY=http://127.0.0.1:8080 to route traffic through this proxy.
 	HTTPProxyAddr string `yaml:"http_proxy_addr"`
+
+	// PortForwards defines local TCP port forwards through the SOCKS5 tunnel.
+	// Each entry listens on a local port and forwards to a remote host:port
+	// through the server's internet connection.
+	PortForwards []PortForwardConfig `yaml:"port_forwards"`
+}
+
+// PortForwardConfig describes a local TCP port forward through the tunnel.
+type PortForwardConfig struct {
+	// LocalPort is the port to listen on locally (e.g. 13389).
+	LocalPort int `yaml:"local_port"`
+	// RemoteHost is the target hostname or IP to connect to via the server (e.g. "192.168.0.5").
+	RemoteHost string `yaml:"remote_host"`
+	// RemotePort is the target port (e.g. 3389 for RDP).
+	RemotePort int `yaml:"remote_port"`
+	// Bind is the local bind address (default "0.0.0.0").
+	Bind string `yaml:"bind"`
 }
 
 // DefaultClientConfig returns a ClientConfig populated with sensible defaults.

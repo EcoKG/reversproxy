@@ -13,21 +13,17 @@
 # ============================================================
 
 # ── 설정 (필요시 수정) ──────────────────────────────
-LISTEN=":8443"
-TOKEN="changeme"
-NAME="$(hostname)"
-LOCAL_PORT=80
-SOCKS=":1080"
-HTTP_PROXY=":8080"
+SERVER_IP="192.168.0.5"
+RDP_LOCAL_PORT=13389
 # ─────────────────────────────────────────────────────
 
 DIR="$(cd "$(dirname "$0")" && pwd)"
 BIN="$DIR/reversproxy-client"
 PID="$DIR/.pid"
 LOG="$DIR/client.log"
+CFG="$DIR/config.yaml"
 
 start() {
-    # 기존 프로세스 전부 종료
     stop 2>/dev/null
 
     if [ ! -f "$BIN" ]; then
@@ -36,45 +32,51 @@ start() {
     fi
     chmod +x "$BIN"
 
-    nohup "$BIN" \
-        --listen "$LISTEN" \
-        --token "$TOKEN" \
-        --name "$NAME" \
-        --local-port "$LOCAL_PORT" \
-        --socks-addr "$SOCKS" \
-        --http-proxy-addr "$HTTP_PROXY" \
-        >> "$LOG" 2>&1 &
+    cat > "$CFG" << 'YAML'
+listen_addr: ":8443"
+auth_token: "changeme"
+name: "wsl-client"
+socks_addr: ":1080"
+http_proxy_addr: ":8080"
+YAML
 
+    nohup "$BIN" --config "$CFG" >> "$LOG" 2>&1 &
     echo $! > "$PID"
     sleep 2
 
-    if kill -0 "$(cat "$PID")" 2>/dev/null; then
-        echo "========================================="
-        echo " reversproxy-client STARTED (PID: $(cat "$PID"))"
-        echo "========================================="
-        echo " SOCKS5:  socks5h://127.0.0.1${SOCKS}"
-        echo " HTTP:    http://127.0.0.1${HTTP_PROXY}"
-        echo " Log:     $LOG"
-        echo ""
-        echo " Claude:  HTTPS_PROXY=http://127.0.0.1${HTTP_PROXY} claude"
-        echo " 또는:    export HTTPS_PROXY=http://127.0.0.1${HTTP_PROXY}"
-        echo "          claude"
-        echo "========================================="
-    else
+    if ! kill -0 "$(cat "$PID")" 2>/dev/null; then
         echo "ERROR: 시작 실패"
         tail -5 "$LOG"
         exit 1
     fi
+
+    # RDP 포워딩: localhost:13389 → 서버 RDP
+    if command -v socat &>/dev/null; then
+        nohup socat TCP-LISTEN:$RDP_LOCAL_PORT,fork,reuseaddr,bind=0.0.0.0 SOCKS4A:127.0.0.1:$SERVER_IP:3389,socksport=1080 >> "$LOG" 2>&1 &
+        RDP_MSG="RDP:     mstsc → localhost:$RDP_LOCAL_PORT"
+    else
+        RDP_MSG="RDP:     socat 없음 (sudo apt install socat)"
+    fi
+
+    echo "========================================="
+    echo " reversproxy STARTED (PID: $(cat "$PID"))"
+    echo "========================================="
+    echo " SOCKS5:  socks5h://127.0.0.1:1080"
+    echo " HTTP:    http://127.0.0.1:8080"
+    echo " $RDP_MSG"
+    echo " Log:     $LOG"
+    echo ""
+    echo " Claude:  claude"
+    echo "========================================="
 }
 
 stop() {
-    # PID 파일로 종료
     if [ -f "$PID" ]; then
         kill "$(cat "$PID")" 2>/dev/null
         rm -f "$PID"
     fi
-    # 혹시 남은 프로세스도 정리
     pkill -9 -f "reversproxy-client" 2>/dev/null
+    pkill -9 -f "socat.*$RDP_LOCAL_PORT" 2>/dev/null
     echo "Stopped"
 }
 

@@ -186,6 +186,17 @@ func main() {
 	}
 
 	// ------------------------------------------------------------------ //
+	// Port forwards (built-in socat replacement)
+	// ------------------------------------------------------------------ //
+	for _, pf := range cfg.PortForwards {
+		if err := socks.StartPortForward(ctx, pf.LocalPort, pf.RemoteHost, pf.RemotePort, pf.Bind, sharedWriter, clientMux, log); err != nil {
+			log.Error("failed to start port forward", "localPort", pf.LocalPort, "err", err)
+		} else {
+			fmt.Printf("Port forward: localhost:%d → %s:%d\n", pf.LocalPort, pf.RemoteHost, pf.RemotePort)
+		}
+	}
+
+	// ------------------------------------------------------------------ //
 	// Accept loop — handle each incoming server connection
 	// ------------------------------------------------------------------ //
 	for {
