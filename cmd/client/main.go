@@ -463,6 +463,7 @@ func handleServerConn(
 	// ------------------------------------------------------------------ //
 	// Message loop
 	// ------------------------------------------------------------------ //
+	const messageReadTimeout = 45 * time.Second
 	for {
 		select {
 		case <-ctx.Done():
@@ -470,6 +471,7 @@ func handleServerConn(
 		default:
 		}
 
+		conn.SetReadDeadline(time.Now().Add(messageReadTimeout))
 		env, err := protocol.ReadMessage(conn)
 		if err != nil {
 			if ctx.Err() != nil {

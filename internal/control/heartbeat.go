@@ -37,7 +37,7 @@ func StartHeartbeat(ctx context.Context, client *Client, log *slog.Logger) {
 			// If the last heartbeat acknowledgement is older than
 			// pingInterval*(maxMissed+1) AND we have already fired maxMissed
 			// unanswered pings, treat the connection as dead.
-			if time.Since(client.LastHeartbeatAt) > pingInterval*time.Duration(maxMissed+1) && missed >= maxMissed {
+			if time.Since(client.LastHeartbeat()) > pingInterval*time.Duration(maxMissed+1) && missed >= maxMissed {
 				log.Warn("heartbeat timeout", "id", client.ID)
 				client.cancelFn()
 				return

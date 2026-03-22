@@ -48,7 +48,7 @@ func startAdminEnv(t *testing.T) *adminTestEnv {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	srv := admin.New(reg, mgr, statsReg, global, log)
+	srv := admin.New(reg, mgr, statsReg, global, log, "")
 
 	// Use :0 so the OS assigns a free port.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -213,8 +213,8 @@ func TestAdminAPI_Tunnels_AfterRegister(t *testing.T) {
 	_ = cert
 
 	tcpEntry := env.mgr.AddTunnel("tunnel-tcp-1", "client-1", "127.0.0.1", 8080, 10080, ln)
-	httpEntry := env.mgr.AddHTTPTunnel("tunnel-http-1", "client-1", "myapp.local", "127.0.0.1", 3000)
-	httpsEntry := env.mgr.AddHTTPSTunnel("tunnel-https-1", "client-2", "secure.local", "127.0.0.1", 4000)
+	httpEntry, _ := env.mgr.AddHTTPTunnel("tunnel-http-1", "client-1", "myapp.local", "127.0.0.1", 3000)
+	httpsEntry, _ := env.mgr.AddHTTPSTunnel("tunnel-https-1", "client-2", "secure.local", "127.0.0.1", 4000)
 
 	body := env.get(t, "/api/tunnels")
 

@@ -29,7 +29,7 @@ var LastHTTPSAddr string
 //
 // TLS is NOT terminated at the proxy; the raw encrypted bytes are forwarded
 // to the client so TLS termination happens at the client's local service.
-func StartHTTPSProxy(ctx context.Context, addr string, mgr *Manager, ctrlConns *ControlConnRegistry, dataAddr string, log *slog.Logger) error {
+func StartHTTPSProxy(ctx context.Context, addr string, mgr *Manager, ctrlConns *ControlConnRegistry, dataAddr string, log *slog.Logger, lim ...*Limiter) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("https proxy: listen %s: %w", addr, err)
@@ -46,6 +46,11 @@ func StartHTTPSProxy(ctx context.Context, addr string, mgr *Manager, ctrlConns *
 			_ = ln.Close()
 		}()
 
+		var rl *Limiter
+		if len(lim) > 0 {
+			rl = lim[0]
+		}
+
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -56,6 +61,26 @@ func StartHTTPSProxy(ctx context.Context, addr string, mgr *Manager, ctrlConns *
 				}
 				return
 			}
+
+			if rl != nil {
+				ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+				if !rl.Allow(ip) {
+					log.Warn("HTTPS proxy: rate limited", "ip", ip)
+					conn.Close()
+					continue
+				}
+				if !rl.Acquire() {
+					log.Warn("HTTPS proxy: max concurrent connections", "ip", ip)
+					conn.Close()
+					continue
+				}
+				go func() {
+					defer rl.Release()
+					handleHTTPSConn(ctx, conn, mgr, ctrlConns, dataAddr, log)
+				}()
+				continue
+			}
+
 			go handleHTTPSConn(ctx, conn, mgr, ctrlConns, dataAddr, log)
 		}
 	}()
@@ -172,26 +197,15 @@ func relayHTTPSConn(ctx context.Context, pending *pendingConn, connID string, pe
 
 	log.Info("HTTPS proxy: relay started", "connID", connID)
 
-	done := make(chan struct{}, 2)
-
-	go func() {
-		copyAndClose(dataConn, extConn)
-		done <- struct{}{}
-	}()
-
-	go func() {
-		copyAndClose(extConn, dataConn)
-		done <- struct{}{}
-	}()
-
-	<-done
-	<-done
-
-	extConn.Close()
-	dataConn.Close()
+	RelayBiDirectional(ctx, extConn, dataConn)
 
 	log.Info("HTTPS proxy: relay finished", "connID", connID)
 }
+
+// maxSNIPeekBytes is the maximum number of bytes we will read from a
+// connection while trying to extract the SNI. This guards against
+// maliciously large TLS records.
+const maxSNIPeekBytes = 65536
 
 // peekSNI reads the first TLS record from r, parses a ClientHello, and
 // returns all bytes read together with the SNI server name.
@@ -215,6 +229,10 @@ func peekSNI(r io.Reader) (peeked []byte, sni string, err error) {
 	recLen := int(binary.BigEndian.Uint16(hdr[3:5]))
 	if recLen <= 0 || recLen > 16384 {
 		return peeked, "", fmt.Errorf("invalid TLS record length: %d", recLen)
+	}
+
+	if tlsHeaderLen+recLen > maxSNIPeekBytes {
+		return peeked, "", fmt.Errorf("TLS record too large: %d bytes exceeds limit %d", tlsHeaderLen+recLen, maxSNIPeekBytes)
 	}
 
 	body := make([]byte, recLen)
@@ -261,6 +279,9 @@ func parseSNIFromClientHello(data []byte) string {
 	}
 	sessIDLen := int(data[pos])
 	pos++
+	if pos+sessIDLen > len(data) {
+		return ""
+	}
 	pos += sessIDLen
 
 	// Cipher suites
@@ -268,7 +289,11 @@ func parseSNIFromClientHello(data []byte) string {
 		return ""
 	}
 	cipherLen := int(binary.BigEndian.Uint16(data[pos : pos+2]))
-	pos += 2 + cipherLen
+	pos += 2
+	if pos+cipherLen > len(data) {
+		return ""
+	}
+	pos += cipherLen
 
 	// Compression methods
 	if len(data) < pos+1 {
@@ -276,6 +301,9 @@ func parseSNIFromClientHello(data []byte) string {
 	}
 	compLen := int(data[pos])
 	pos++
+	if pos+compLen > len(data) {
+		return ""
+	}
 	pos += compLen
 
 	// Extensions length
@@ -338,12 +366,4 @@ func parseSNIExtension(data []byte) string {
 	}
 
 	return ""
-}
-
-// copyAndClose copies from src to dst, then half-closes dst if it is a TCPConn.
-func copyAndClose(dst, src net.Conn) {
-	_, _ = io.Copy(dst, src)
-	if tc, ok := dst.(*net.TCPConn); ok {
-		_ = tc.CloseWrite()
-	}
 }

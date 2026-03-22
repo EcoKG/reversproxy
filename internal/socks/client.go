@@ -100,150 +100,11 @@ func handleClientSOCKSConn(
 
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	// ------------------------------------------------------------------ //
-	// Phase 1 — Greeting / method negotiation
-	// ------------------------------------------------------------------ //
-
-	hdr := make([]byte, 2)
-	if _, err := io.ReadFull(conn, hdr); err != nil {
-		log.Debug("socks5 client: failed to read greeting header", "err", err)
+	targetHost, targetPort, err := NegotiateSOCKS5(conn, authUser, authPass, log)
+	if err != nil {
+		log.Debug("socks5 client: handshake failed", "err", err, "remote", conn.RemoteAddr())
 		return
 	}
-	if hdr[0] != socks5Version {
-		log.Debug("socks5 client: unsupported version", "ver", hdr[0])
-		return
-	}
-
-	nMethods := int(hdr[1])
-	if nMethods == 0 {
-		_, _ = conn.Write([]byte{socks5Version, authNoAccept})
-		return
-	}
-
-	methods := make([]byte, nMethods)
-	if _, err := io.ReadFull(conn, methods); err != nil {
-		log.Debug("socks5 client: failed to read methods", "err", err)
-		return
-	}
-
-	authRequired := authUser != "" && authPass != ""
-	selectedMethod := byte(authNoAccept)
-	for _, m := range methods {
-		if authRequired && m == authPassword {
-			selectedMethod = authPassword
-			break
-		}
-		if !authRequired && m == authNone {
-			selectedMethod = authNone
-			break
-		}
-	}
-
-	if selectedMethod == authNoAccept {
-		_, _ = conn.Write([]byte{socks5Version, authNoAccept})
-		return
-	}
-	if _, err := conn.Write([]byte{socks5Version, selectedMethod}); err != nil {
-		return
-	}
-
-	// ------------------------------------------------------------------ //
-	// Phase 2 — RFC 1929 auth sub-negotiation
-	// ------------------------------------------------------------------ //
-
-	if selectedMethod == authPassword {
-		authHdr := make([]byte, 2)
-		if _, err := io.ReadFull(conn, authHdr); err != nil {
-			return
-		}
-		if authHdr[0] != 0x01 {
-			_, _ = conn.Write([]byte{0x01, 0x01})
-			return
-		}
-
-		uBuf := make([]byte, int(authHdr[1]))
-		if _, err := io.ReadFull(conn, uBuf); err != nil {
-			return
-		}
-
-		pLenBuf := make([]byte, 1)
-		if _, err := io.ReadFull(conn, pLenBuf); err != nil {
-			return
-		}
-
-		pBuf := make([]byte, int(pLenBuf[0]))
-		if _, err := io.ReadFull(conn, pBuf); err != nil {
-			return
-		}
-
-		if string(uBuf) != authUser || string(pBuf) != authPass {
-			_, _ = conn.Write([]byte{0x01, 0x01})
-			log.Warn("socks5 client: authentication failed", "remote", conn.RemoteAddr())
-			return
-		}
-
-		if _, err := conn.Write([]byte{0x01, 0x00}); err != nil {
-			return
-		}
-	}
-
-	// ------------------------------------------------------------------ //
-	// Phase 3 — CONNECT request
-	// ------------------------------------------------------------------ //
-
-	reqHdr := make([]byte, 4)
-	if _, err := io.ReadFull(conn, reqHdr); err != nil {
-		log.Debug("socks5 client: failed to read request header", "err", err)
-		return
-	}
-	if reqHdr[0] != socks5Version {
-		sendSOCKSReply(conn, repGeneralFailure, nil, 0)
-		return
-	}
-	if reqHdr[1] != cmdConnect {
-		sendSOCKSReply(conn, repCmdNotSupported, nil, 0)
-		return
-	}
-
-	atyp := reqHdr[3]
-	var targetHost string
-
-	switch atyp {
-	case atypIPv4:
-		addr4 := make([]byte, 4)
-		if _, err := io.ReadFull(conn, addr4); err != nil {
-			return
-		}
-		targetHost = net.IP(addr4).String()
-
-	case atypDomain:
-		lenBuf := make([]byte, 1)
-		if _, err := io.ReadFull(conn, lenBuf); err != nil {
-			return
-		}
-		domainBuf := make([]byte, int(lenBuf[0]))
-		if _, err := io.ReadFull(conn, domainBuf); err != nil {
-			return
-		}
-		targetHost = string(domainBuf)
-
-	case atypIPv6:
-		addr6 := make([]byte, 16)
-		if _, err := io.ReadFull(conn, addr6); err != nil {
-			return
-		}
-		targetHost = net.IP(addr6).String()
-
-	default:
-		sendSOCKSReply(conn, repAddrNotSupported, nil, 0)
-		return
-	}
-
-	portBuf := make([]byte, 2)
-	if _, err := io.ReadFull(conn, portBuf); err != nil {
-		return
-	}
-	targetPort := int(portBuf[0])<<8 | int(portBuf[1])
 
 	_ = conn.SetDeadline(time.Time{})
 
@@ -333,7 +194,11 @@ func handleClientSOCKSConn(
 			if n > 0 {
 				payload := make([]byte, n)
 				copy(payload, buf[:n])
-				outSend <- payload
+				select {
+				case outSend <- payload:
+				case <-ctx.Done():
+					return
+				}
 			}
 			if err != nil {
 				return

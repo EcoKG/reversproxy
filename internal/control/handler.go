@@ -175,6 +175,7 @@ func HandleControlConn(
 	// ------------------------------------------------------------------ //
 	// Message loop
 	// ------------------------------------------------------------------ //
+	const messageReadTimeout = 45 * time.Second
 	for {
 		// Bail out if the parent (or client) context has been cancelled.
 		select {
@@ -184,6 +185,7 @@ func HandleControlConn(
 		default:
 		}
 
+		conn.SetReadDeadline(time.Now().Add(messageReadTimeout))
 		env, err := protocol.ReadMessage(conn)
 		if err != nil {
 			if errors.Is(err, io.EOF) {
@@ -207,7 +209,7 @@ func HandleControlConn(
 				log.Warn("failed to decode Pong", "id", client.ID, "err", err)
 				continue
 			}
-			client.LastHeartbeatAt = time.Now()
+			client.SetLastHeartbeat(time.Now())
 
 		case protocol.MsgDisconnect:
 			var disc protocol.Disconnect
@@ -219,7 +221,9 @@ func HandleControlConn(
 					"reason", disc.Reason,
 				)
 			}
-			_ = protocol.WriteMessage(conn, protocol.MsgDisconnectAck, protocol.DisconnectAck{})
+			if err := protocol.WriteMessage(conn, protocol.MsgDisconnectAck, protocol.DisconnectAck{}); err != nil {
+				log.Debug("failed to send DisconnectAck", "id", client.ID, "err", err)
+			}
 			return
 
 		case protocol.MsgRequestTunnel:
@@ -293,6 +297,18 @@ func handleServerSOCKSConnect(
 	log = log.With("connID", sc.ConnID, "target", fmt.Sprintf("%s:%d", sc.TargetHost, sc.TargetPort))
 
 	go func() {
+		if err := protocol.ValidateTarget(sc.TargetHost, sc.TargetPort, 1); err != nil {
+			log.Warn("server: invalid SOCKS target", "err", err)
+			if werr := cw.Write(protocol.MsgSOCKSReady, protocol.SOCKSReady{
+				ConnID:  sc.ConnID,
+				Success: false,
+				Error:   err.Error(),
+			}); werr != nil {
+				log.Debug("server: failed to send SOCKSReady failure", "err", werr)
+			}
+			return
+		}
+
 		targetAddr := fmt.Sprintf("%s:%d", sc.TargetHost, sc.TargetPort)
 
 		// Allocate the server-side channel before dialling so that incoming
@@ -300,11 +316,13 @@ func handleServerSOCKSConnect(
 		ch, err := mux.NewChannel(sc.ConnID)
 		if err != nil {
 			log.Warn("server: mux.NewChannel failed", "err", err)
-			_ = cw.Write(protocol.MsgSOCKSReady, protocol.SOCKSReady{
+			if werr := cw.Write(protocol.MsgSOCKSReady, protocol.SOCKSReady{
 				ConnID:  sc.ConnID,
 				Success: false,
 				Error:   err.Error(),
-			})
+			}); werr != nil {
+				log.Debug("server: failed to send SOCKSReady failure", "err", werr)
+			}
 			return
 		}
 		defer mux.Remove(sc.ConnID)
@@ -313,11 +331,13 @@ func handleServerSOCKSConnect(
 		targetConn, err := net.DialTimeout("tcp", targetAddr, 15*time.Second)
 		if err != nil {
 			log.Warn("server: failed to dial target", "err", err)
-			_ = cw.Write(protocol.MsgSOCKSReady, protocol.SOCKSReady{
+			if werr := cw.Write(protocol.MsgSOCKSReady, protocol.SOCKSReady{
 				ConnID:  sc.ConnID,
 				Success: false,
 				Error:   err.Error(),
-			})
+			}); werr != nil {
+				log.Debug("server: failed to send SOCKSReady failure", "err", werr)
+			}
 			return
 		}
 		defer targetConn.Close()
@@ -348,7 +368,11 @@ func handleServerSOCKSConnect(
 				if n > 0 {
 					payload := make([]byte, n)
 					copy(payload, buf[:n])
-					outSend <- payload
+					select {
+					case outSend <- payload:
+					case <-ctx.Done():
+						return
+					}
 				}
 				if err != nil {
 					return
@@ -389,7 +413,9 @@ func handleServerSOCKSConnect(
 		//      on this side gets EOF and exits.
 		//   4. Wait for goroutine B.
 		<-muxWriterDone
-		_ = cw.Write(protocol.MsgSOCKSClose, protocol.SOCKSClose{ConnID: sc.ConnID})
+		if werr := cw.Write(protocol.MsgSOCKSClose, protocol.SOCKSClose{ConnID: sc.ConnID}); werr != nil {
+			log.Debug("server: failed to send SOCKSClose", "err", werr)
+		}
 
 		// Wait for goroutine B to exit (triggered by client's MsgSOCKSClose).
 		<-recvDone
@@ -414,15 +440,26 @@ func handleRequestHTTPTunnel(
 	var req protocol.RequestHTTPTunnel
 	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&req); err != nil {
 		log.Warn("failed to decode RequestHTTPTunnel", "id", client.ID, "err", err)
-		_ = protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
+		if werr := protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
 			Status: "error",
 			Error:  "malformed RequestHTTPTunnel payload",
-		})
+		}); werr != nil {
+			log.Debug("failed to send HTTP tunnel error response", "id", client.ID, "err", werr)
+		}
 		return
 	}
 
 	tunnelID := uuid.New().String()
-	mgr.AddHTTPTunnel(tunnelID, client.ID, req.Hostname, req.LocalHost, req.LocalPort)
+	if _, err := mgr.AddHTTPTunnel(tunnelID, client.ID, req.Hostname, req.LocalHost, req.LocalPort); err != nil {
+		log.Warn("HTTP tunnel registration failed", "id", client.ID, "hostname", req.Hostname, "err", err)
+		if werr := protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
+			Status: "error",
+			Error:  err.Error(),
+		}); werr != nil {
+			log.Debug("failed to send HTTP tunnel error response", "id", client.ID, "err", werr)
+		}
+		return
+	}
 
 	log.Info("HTTP tunnel registered",
 		"tunnelID", tunnelID,
@@ -432,12 +469,14 @@ func handleRequestHTTPTunnel(
 		"localPort", req.LocalPort,
 	)
 
-	_ = protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
+	if err := protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
 		Hostname:       req.Hostname,
 		TunnelID:       tunnelID,
 		ServerDataAddr: dataAddr,
 		Status:         "ok",
-	})
+	}); err != nil {
+		log.Warn("failed to send HTTPTunnelResp", "id", client.ID, "err", err)
+	}
 }
 
 // handleRequestHTTPSTunnel processes a MsgRequestHTTPSTunnel from a client.
@@ -453,15 +492,26 @@ func handleRequestHTTPSTunnel(
 	var req protocol.RequestHTTPSTunnel
 	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&req); err != nil {
 		log.Warn("failed to decode RequestHTTPSTunnel", "id", client.ID, "err", err)
-		_ = protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
+		if werr := protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
 			Status: "error",
 			Error:  "malformed RequestHTTPSTunnel payload",
-		})
+		}); werr != nil {
+			log.Debug("failed to send HTTPS tunnel error response", "id", client.ID, "err", werr)
+		}
 		return
 	}
 
 	tunnelID := uuid.New().String()
-	mgr.AddHTTPSTunnel(tunnelID, client.ID, req.Hostname, req.LocalHost, req.LocalPort)
+	if _, err := mgr.AddHTTPSTunnel(tunnelID, client.ID, req.Hostname, req.LocalHost, req.LocalPort); err != nil {
+		log.Warn("HTTPS tunnel registration failed", "id", client.ID, "hostname", req.Hostname, "err", err)
+		if werr := protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
+			Status: "error",
+			Error:  err.Error(),
+		}); werr != nil {
+			log.Debug("failed to send HTTPS tunnel error response", "id", client.ID, "err", werr)
+		}
+		return
+	}
 
 	log.Info("HTTPS tunnel registered",
 		"tunnelID", tunnelID,
@@ -471,12 +521,14 @@ func handleRequestHTTPSTunnel(
 		"localPort", req.LocalPort,
 	)
 
-	_ = protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
+	if err := protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
 		Hostname:       req.Hostname,
 		TunnelID:       tunnelID,
 		ServerDataAddr: dataAddr,
 		Status:         "ok",
-	})
+	}); err != nil {
+		log.Warn("failed to send HTTPSTunnelResp", "id", client.ID, "err", err)
+	}
 }
 
 // handleRequestTunnel processes a MsgRequestTunnel from a client.
@@ -493,10 +545,12 @@ func handleRequestTunnel(
 	var req protocol.RequestTunnel
 	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&req); err != nil {
 		log.Warn("failed to decode RequestTunnel", "id", client.ID, "err", err)
-		_ = protocol.WriteMessage(conn, protocol.MsgTunnelResp, protocol.TunnelResp{
+		if werr := protocol.WriteMessage(conn, protocol.MsgTunnelResp, protocol.TunnelResp{
 			Status: "error",
 			Error:  "malformed RequestTunnel payload",
-		})
+		}); werr != nil {
+			log.Debug("failed to send tunnel error response", "id", client.ID, "err", werr)
+		}
 		return
 	}
 
@@ -506,10 +560,12 @@ func handleRequestTunnel(
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Error("failed to open public listener", "id", client.ID, "addr", listenAddr, "err", err)
-		_ = protocol.WriteMessage(conn, protocol.MsgTunnelResp, protocol.TunnelResp{
+		if werr := protocol.WriteMessage(conn, protocol.MsgTunnelResp, protocol.TunnelResp{
 			Status: "error",
 			Error:  fmt.Sprintf("could not listen on %s: %v", listenAddr, err),
-		})
+		}); werr != nil {
+			log.Debug("failed to send tunnel error response", "id", client.ID, "err", werr)
+		}
 		return
 	}
 

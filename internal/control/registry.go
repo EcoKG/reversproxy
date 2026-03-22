@@ -4,6 +4,7 @@ import (
 	"context"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -11,13 +12,25 @@ import (
 
 // Client represents a connected control-plane client.
 type Client struct {
-	ID              string
-	Name            string
-	Addr            string
-	RegisteredAt    time.Time
-	LastHeartbeatAt time.Time
-	Conn            net.Conn
-	cancelFn        context.CancelFunc
+	ID            string
+	Name          string
+	Addr          string
+	RegisteredAt  time.Time
+	lastHeartbeat atomic.Value // stores time.Time
+	Conn          net.Conn
+	cancelFn      context.CancelFunc
+}
+
+// SetLastHeartbeat atomically updates the last heartbeat timestamp.
+func (c *Client) SetLastHeartbeat(t time.Time) { c.lastHeartbeat.Store(t) }
+
+// LastHeartbeat atomically reads the last heartbeat timestamp.
+func (c *Client) LastHeartbeat() time.Time {
+	v := c.lastHeartbeat.Load()
+	if v == nil {
+		return time.Time{}
+	}
+	return v.(time.Time)
 }
 
 // ClientRegistry is a thread-safe registry of connected clients.
@@ -39,14 +52,14 @@ func NewClientRegistry() *ClientRegistry {
 // that heartbeat or handler goroutines can cancel the client's context.
 func (r *ClientRegistry) Register(name, addr string, conn net.Conn, cancelFn context.CancelFunc) *Client {
 	client := &Client{
-		ID:              uuid.New().String(),
-		Name:            name,
-		Addr:            addr,
-		RegisteredAt:    time.Now(),
-		LastHeartbeatAt: time.Now(),
-		Conn:            conn,
-		cancelFn:        cancelFn,
+		ID:           uuid.New().String(),
+		Name:         name,
+		Addr:         addr,
+		RegisteredAt: time.Now(),
+		Conn:         conn,
+		cancelFn:     cancelFn,
 	}
+	client.SetLastHeartbeat(time.Now())
 
 	r.mu.Lock()
 	r.clients[client.ID] = client

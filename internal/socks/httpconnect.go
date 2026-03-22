@@ -249,7 +249,11 @@ func handleHTTPConnectConn(
 			if n > 0 {
 				payload := make([]byte, n)
 				copy(payload, buf[:n])
-				outSend <- payload
+				select {
+				case outSend <- payload:
+				case <-ctx.Done():
+					return
+				}
 			}
 			if rerr != nil {
 				return

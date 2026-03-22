@@ -46,6 +46,22 @@ type ServerConfig struct {
 	CertPath string `yaml:"cert_path"`
 	// KeyPath is the path to the TLS private key file.
 	KeyPath string `yaml:"key_path"`
+	// AdminToken is a Bearer token required for admin API access (empty = no auth).
+	AdminToken string `yaml:"admin_token"`
+	// MinPort is the minimum allowed destination port for SOCKS/tunnel connections (default 1).
+	MinPort int `yaml:"min_port"`
+	// Insecure skips TLS certificate verification when dialing clients (development only).
+	Insecure bool `yaml:"insecure"`
+	// ClientCACert is the path to a CA certificate for verifying client TLS certificates.
+	ClientCACert string `yaml:"client_ca_cert"`
+	// TLSFingerprint is an expected SHA-256 fingerprint of the client's TLS certificate.
+	TLSFingerprint string `yaml:"tls_fingerprint"`
+	// MaxConnRate is the per-IP connection rate limit (connections per second; 0 = unlimited).
+	MaxConnRate float64 `yaml:"max_conn_rate"`
+	// MaxConnBurst is the burst size for per-IP rate limiting (default 10).
+	MaxConnBurst int `yaml:"max_conn_burst"`
+	// MaxConcurrent is the maximum number of concurrent proxy connections (0 = unlimited).
+	MaxConcurrent int64 `yaml:"max_concurrent"`
 	// LogLevel controls the verbosity of the logger (debug/info/warn/error).
 	LogLevel string `yaml:"log_level"`
 	// Clients is the list of client addresses the server will dial.
@@ -64,6 +80,8 @@ func DefaultServerConfig() *ServerConfig {
 		AuthToken: "changeme",
 		CertPath:  "server.crt",
 		KeyPath:   "server.key",
+		Insecure:  true,
+		MinPort:   1,
 		LogLevel:  "info",
 	}
 }

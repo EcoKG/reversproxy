@@ -28,7 +28,7 @@ var LastHTTPAddr string
 //
 // This design keeps TLS termination and HTTP parsing at the client side for
 // HTTPS tunnels; plain-HTTP tunnels are fully relayed at the TCP level.
-func StartHTTPProxy(ctx context.Context, addr string, mgr *Manager, ctrlConns *ControlConnRegistry, dataAddr string, log *slog.Logger) error {
+func StartHTTPProxy(ctx context.Context, addr string, mgr *Manager, ctrlConns *ControlConnRegistry, dataAddr string, log *slog.Logger, lim ...*Limiter) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("http proxy: listen %s: %w", addr, err)
@@ -45,6 +45,11 @@ func StartHTTPProxy(ctx context.Context, addr string, mgr *Manager, ctrlConns *C
 			_ = ln.Close()
 		}()
 
+		var rl *Limiter
+		if len(lim) > 0 {
+			rl = lim[0]
+		}
+
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -55,6 +60,26 @@ func StartHTTPProxy(ctx context.Context, addr string, mgr *Manager, ctrlConns *C
 				}
 				return
 			}
+
+			if rl != nil {
+				ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+				if !rl.Allow(ip) {
+					log.Warn("HTTP proxy: rate limited", "ip", ip)
+					conn.Close()
+					continue
+				}
+				if !rl.Acquire() {
+					log.Warn("HTTP proxy: max concurrent connections", "ip", ip)
+					conn.Close()
+					continue
+				}
+				go func() {
+					defer rl.Release()
+					handleHTTPConn(ctx, conn, mgr, ctrlConns, dataAddr, log)
+				}()
+				continue
+			}
+
 			go handleHTTPConn(ctx, conn, mgr, ctrlConns, dataAddr, log)
 		}
 	}()
@@ -137,6 +162,15 @@ func handleHTTPConn(
 	rawReqBuf := &peekBuffer{}
 	_ = req.Write(rawReqBuf)
 
+	// If the bufio.Reader has buffered bytes beyond the HTTP request (e.g.,
+	// pipelined data or a request body), append them so nothing is lost.
+	if br.Buffered() > 0 {
+		remaining, _ := br.Peek(br.Buffered())
+		rawReqBuf.Write(remaining)
+		// Discard the peeked bytes from the reader so they aren't read again.
+		_, _ = br.Discard(len(remaining))
+	}
+
 	// Register the pending connection (external conn) before sending OpenConnection.
 	pending := mgr.RegisterPending(connID, extConn)
 
@@ -191,23 +225,7 @@ func relayHTTPConn(ctx context.Context, pending *pendingConn, connID string, raw
 
 	log.Info("HTTP proxy: relay started", "connID", connID)
 
-	done := make(chan struct{}, 2)
-
-	go func() {
-		copyAndClose(dataConn, extConn)
-		done <- struct{}{}
-	}()
-
-	go func() {
-		copyAndClose(extConn, dataConn)
-		done <- struct{}{}
-	}()
-
-	<-done
-	<-done
-
-	extConn.Close()
-	dataConn.Close()
+	RelayBiDirectional(ctx, extConn, dataConn)
 
 	log.Info("HTTP proxy: relay finished", "connID", connID)
 }

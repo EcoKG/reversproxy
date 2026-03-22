@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
+	"crypto/x509"
 	"flag"
 	"log/slog"
 	"net"
@@ -118,9 +119,15 @@ func main() {
 	// dataAddr may have been :0 (OS-assigned); use the actual bound address.
 	resolvedDataAddr := tunnel.DataAddr
 
+	// Build rate limiter for proxy accept loops.
+	var proxyLimiter *tunnel.Limiter
+	if cfg.MaxConnRate > 0 || cfg.MaxConcurrent > 0 {
+		proxyLimiter = tunnel.NewLimiter(cfg.MaxConnRate, cfg.MaxConnBurst, cfg.MaxConcurrent)
+	}
+
 	// Start the HTTP host-based proxy.
 	if cfg.HTTPAddr != "" {
-		if err := tunnel.StartHTTPProxy(ctx, cfg.HTTPAddr, mgr, ctrlConns, resolvedDataAddr, log); err != nil {
+		if err := tunnel.StartHTTPProxy(ctx, cfg.HTTPAddr, mgr, ctrlConns, resolvedDataAddr, log, proxyLimiter); err != nil {
 			log.Error("failed to start HTTP proxy", "addr", cfg.HTTPAddr, "err", err)
 			os.Exit(1)
 		}
@@ -128,7 +135,7 @@ func main() {
 
 	// Start the HTTPS SNI-routing proxy.
 	if cfg.HTTPSAddr != "" {
-		if err := tunnel.StartHTTPSProxy(ctx, cfg.HTTPSAddr, mgr, ctrlConns, resolvedDataAddr, log); err != nil {
+		if err := tunnel.StartHTTPSProxy(ctx, cfg.HTTPSAddr, mgr, ctrlConns, resolvedDataAddr, log, proxyLimiter); err != nil {
 			log.Error("failed to start HTTPS proxy", "addr", cfg.HTTPSAddr, "err", err)
 			os.Exit(1)
 		}
@@ -140,7 +147,7 @@ func main() {
 
 	// Start the admin API server.
 	if cfg.AdminAddr != "" {
-		adminSrv := admin.New(reg, mgr, statsReg, globalStats, log)
+		adminSrv := admin.New(reg, mgr, statsReg, globalStats, log, cfg.AdminToken)
 		if err := adminSrv.Start(ctx, cfg.AdminAddr); err != nil {
 			log.Error("failed to start admin server", "addr", cfg.AdminAddr, "err", err)
 			os.Exit(1)
@@ -169,6 +176,9 @@ func main() {
 			"hint", "add 'clients:' entries to config.yaml")
 	}
 
+	// Build TLS config for dialing clients.
+	clientTLSCfg := buildClientTLSConfig(cfg, log)
+
 	var wg sync.WaitGroup
 
 	for _, target := range cfg.Clients {
@@ -183,7 +193,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			dialClientLoop(ctx, target, effectiveToken, reg, mgr, resolvedDataAddr, ctrlConns, log, globalStats)
+			dialClientLoop(ctx, target, effectiveToken, reg, mgr, resolvedDataAddr, ctrlConns, log, globalStats, clientTLSCfg)
 		}()
 	}
 
@@ -230,13 +240,8 @@ func dialClientLoop(
 	ctrlConns *tunnel.ControlConnRegistry,
 	log *slog.Logger,
 	globalStats *stats.ServerStats,
+	tlsCfg *tls.Config,
 ) {
-	// Server dials clients with InsecureSkipVerify by default (self-signed certs).
-	// For production, provide a trusted CA in the TLS config.
-	tlsCfg := &tls.Config{
-		InsecureSkipVerify: true, //nolint:gosec // intentional: clients use self-signed certs
-		MinVersion:         tls.VersionTLS13,
-	}
 
 	backoff := reconnect.NewBackoff()
 
@@ -300,4 +305,40 @@ func dialClientLoop(
 		// Reset backoff when we successfully reconnect (on next successful HandleControlConn).
 		backoff.Reset()
 	}
+}
+
+// buildClientTLSConfig builds a *tls.Config for the server's outbound
+// connections to clients based on the ServerConfig settings.
+func buildClientTLSConfig(cfg *config.ServerConfig, log *slog.Logger) *tls.Config {
+	tlsCfg := &tls.Config{
+		MinVersion: tls.VersionTLS13,
+	}
+
+	if cfg.Insecure {
+		tlsCfg.InsecureSkipVerify = true //nolint:gosec // intentional: dev mode
+		return tlsCfg
+	}
+
+	if cfg.ClientCACert != "" {
+		caCert, err := os.ReadFile(cfg.ClientCACert)
+		if err != nil {
+			log.Error("failed to read client CA cert", "path", cfg.ClientCACert, "err", err)
+			// Fall back to insecure
+			tlsCfg.InsecureSkipVerify = true //nolint:gosec
+			return tlsCfg
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(caCert) {
+			log.Error("failed to parse client CA cert", "path", cfg.ClientCACert)
+			tlsCfg.InsecureSkipVerify = true //nolint:gosec
+			return tlsCfg
+		}
+		tlsCfg.RootCAs = pool
+		return tlsCfg
+	}
+
+	// No CA cert configured and not insecure — default to insecure for
+	// backward compatibility with self-signed certs.
+	tlsCfg.InsecureSkipVerify = true //nolint:gosec
+	return tlsCfg
 }

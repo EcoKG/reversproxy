@@ -33,7 +33,7 @@ func StartPortForward(
 	log *slog.Logger,
 ) error {
 	if bindAddr == "" {
-		bindAddr = "0.0.0.0"
+		bindAddr = "127.0.0.1"
 	}
 	addr := fmt.Sprintf("%s:%d", bindAddr, localPort)
 
@@ -138,7 +138,11 @@ func handlePortForward(
 			if n > 0 {
 				payload := make([]byte, n)
 				copy(payload, buf[:n])
-				outSend <- payload
+				select {
+				case outSend <- payload:
+				case <-ctx.Done():
+					return
+				}
 			}
 			if err != nil {
 				return

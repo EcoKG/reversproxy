@@ -3,3 +3,11 @@ dist/
 *.key
 *.pem
 config.yaml
+
+# Vela Engine (auto-managed)
+.vela/cache/
+.vela/state/
+.vela/artifacts/
+.vela/tracker-signals.json
+.vela/write-log.jsonl
+*.vela-tmp

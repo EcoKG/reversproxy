@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 )
 
 // SOCKSChannel is a logical, bidirectional byte-stream channel multiplexed
@@ -161,6 +162,31 @@ func (m *SOCKSMux) Get(connID string) *SOCKSChannel {
 	ch := m.channels[connID]
 	m.mu.RUnlock()
 	return ch
+}
+
+// DrainAndClose waits up to timeout for all channels to be removed by their
+// owners, then force-closes any that remain. This allows in-flight relays to
+// finish gracefully before a hard teardown.
+func (m *SOCKSMux) DrainAndClose(timeout time.Duration) {
+	deadline := time.After(timeout)
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		m.mu.RLock()
+		n := len(m.channels)
+		m.mu.RUnlock()
+		if n == 0 {
+			return
+		}
+
+		select {
+		case <-deadline:
+			m.CloseAll()
+			return
+		case <-ticker.C:
+		}
+	}
 }
 
 // CloseAll tears down every registered channel (e.g. on control conn loss).

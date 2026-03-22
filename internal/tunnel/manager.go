@@ -164,8 +164,9 @@ func PendingExtConn(p *pendingConn) net.Conn {
 }
 
 // AddHTTPTunnel registers a hostname for plain-HTTP routing.
-// Returns the new entry. If the hostname is already registered the old entry is replaced.
-func (m *Manager) AddHTTPTunnel(tunnelID, clientID, hostname, localHost string, localPort int) *HTTPTunnelEntry {
+// Returns an error if the hostname is already registered by a different client.
+// If the same client re-registers a hostname, the old entry is replaced.
+func (m *Manager) AddHTTPTunnel(tunnelID, clientID, hostname, localHost string, localPort int) (*HTTPTunnelEntry, error) {
 	entry := &HTTPTunnelEntry{
 		ID:        tunnelID,
 		ClientID:  clientID,
@@ -175,14 +176,20 @@ func (m *Manager) AddHTTPTunnel(tunnelID, clientID, hostname, localHost string, 
 		IsTLS:     false,
 	}
 	m.mu.Lock()
+	if existing, ok := m.httpTunnels[hostname]; ok && existing.ClientID != clientID {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("hostname %q already registered by client %s", hostname, existing.ClientID)
+	}
 	m.httpTunnels[hostname] = entry
 	m.httpByClient[clientID] = append(m.httpByClient[clientID], hostname)
 	m.mu.Unlock()
-	return entry
+	return entry, nil
 }
 
 // AddHTTPSTunnel registers a hostname for HTTPS/SNI routing.
-func (m *Manager) AddHTTPSTunnel(tunnelID, clientID, hostname, localHost string, localPort int) *HTTPTunnelEntry {
+// Returns an error if the hostname is already registered by a different client.
+// If the same client re-registers a hostname, the old entry is replaced.
+func (m *Manager) AddHTTPSTunnel(tunnelID, clientID, hostname, localHost string, localPort int) (*HTTPTunnelEntry, error) {
 	entry := &HTTPTunnelEntry{
 		ID:        tunnelID,
 		ClientID:  clientID,
@@ -192,10 +199,14 @@ func (m *Manager) AddHTTPSTunnel(tunnelID, clientID, hostname, localHost string,
 		IsTLS:     true,
 	}
 	m.mu.Lock()
+	if existing, ok := m.httpsTunnels[hostname]; ok && existing.ClientID != clientID {
+		m.mu.Unlock()
+		return nil, fmt.Errorf("HTTPS hostname %q already registered by client %s", hostname, existing.ClientID)
+	}
 	m.httpsTunnels[hostname] = entry
 	m.httpsByClient[clientID] = append(m.httpsByClient[clientID], hostname)
 	m.mu.Unlock()
-	return entry
+	return entry, nil
 }
 
 // GetHTTPTunnel looks up an HTTP tunnel by hostname. Returns nil, false if not found.

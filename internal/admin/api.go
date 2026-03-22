@@ -10,11 +10,13 @@ package admin
 
 import (
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"fmt"
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/EcoKG/reversproxy/internal/control"
@@ -63,18 +65,21 @@ type Server struct {
 	mgr      *tunnel.Manager
 	statsReg *stats.Registry
 	global   *stats.ServerStats
+	token    string
 	log      *slog.Logger
 	httpSrv  *http.Server
 }
 
 // New creates a new admin Server. statsReg and global may be nil; in that
-// case the stats endpoint returns zeroed counters.
+// case the stats endpoint returns zeroed counters. token is a Bearer token
+// required for authentication; empty means no auth.
 func New(
 	reg *control.ClientRegistry,
 	mgr *tunnel.Manager,
 	statsReg *stats.Registry,
 	global *stats.ServerStats,
 	log *slog.Logger,
+	token string,
 ) *Server {
 	if global == nil {
 		global = stats.Global
@@ -87,22 +92,49 @@ func New(
 		mgr:      mgr,
 		statsReg: statsReg,
 		global:   global,
+		token:    token,
 		log:      log,
+	}
+}
+
+// authMiddleware returns a handler that checks for a valid Bearer token
+// before calling next. If no token is configured, it passes through.
+func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if s.token == "" {
+			next(w, r)
+			return
+		}
+		auth := r.Header.Get("Authorization")
+		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		if subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(s.token)) != 1 {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
 	}
 }
 
 // Start starts the admin HTTP server on addr in a background goroutine.
 // The server is shut down when ctx is cancelled.
 func (s *Server) Start(ctx context.Context, addr string) error {
+	// Default to localhost-only when no host is specified.
+	if strings.HasPrefix(addr, ":") {
+		addr = "127.0.0.1" + addr
+	}
+
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("admin: listen %s: %w", addr, err)
 	}
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/api/clients", s.handleClients)
-	mux.HandleFunc("/api/tunnels", s.handleTunnels)
-	mux.HandleFunc("/api/stats", s.handleStats)
+	mux.HandleFunc("/api/clients", s.authMiddleware(s.handleClients))
+	mux.HandleFunc("/api/tunnels", s.authMiddleware(s.handleTunnels))
+	mux.HandleFunc("/api/stats", s.authMiddleware(s.handleStats))
 
 	s.httpSrv = &http.Server{
 		Handler:      mux,

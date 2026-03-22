@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/gob"
-	"io"
 	"log/slog"
 	"net"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/EcoKG/reversproxy/internal/protocol"
@@ -46,6 +46,10 @@ func StartDataListener(ctx context.Context, addr string, mgr *Manager, log *slog
 					log.Error("data listener accept error", "err", err)
 				}
 				return
+			}
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.SetKeepAlive(true)
+				_ = tc.SetKeepAlivePeriod(15 * time.Second)
 			}
 			go handleDataConn(conn, mgr, log)
 		}
@@ -117,6 +121,10 @@ func StartPublicListener(
 			}
 			return
 		}
+		if tc, ok := extConn.(*net.TCPConn); ok {
+			_ = tc.SetKeepAlive(true)
+			_ = tc.SetKeepAlivePeriod(15 * time.Second)
+		}
 
 		connID := uuid.New().String()
 		log.Info("external connection received", "connID", connID, "remoteAddr", extConn.RemoteAddr())
@@ -165,57 +173,7 @@ func relayExternalConn(ctx context.Context, pending *pendingConn, connID string,
 
 	log.Info("relay started", "connID", connID)
 
-	// Bidirectional relay: copy in both directions concurrently.
-	done := make(chan struct{}, 2)
-
-	go func() {
-		_, err := io.Copy(dataConn, extConn)
-		if err != nil && !isClosedErr(err) {
-			log.Debug("relay ext→data done", "connID", connID, "err", err)
-		}
-		_ = dataConn.(*net.TCPConn).CloseWrite()
-		done <- struct{}{}
-	}()
-
-	go func() {
-		_, err := io.Copy(extConn, dataConn)
-		if err != nil && !isClosedErr(err) {
-			log.Debug("relay data→ext done", "connID", connID, "err", err)
-		}
-		if tc, ok := extConn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
-
-	<-done
-	<-done
-
-	extConn.Close()
-	dataConn.Close()
+	RelayBiDirectional(ctx, extConn, dataConn)
 
 	log.Info("relay finished", "connID", connID)
-}
-
-// isClosedErr returns true for "use of closed network connection" errors that
-// occur naturally when we close a connection to unblock a goroutine.
-func isClosedErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	return containsStr(err.Error(), "use of closed network connection") ||
-		containsStr(err.Error(), "EOF")
-}
-
-func containsStr(s, sub string) bool {
-	return len(s) >= len(sub) && (s == sub || len(s) > 0 && searchStr(s, sub))
-}
-
-func searchStr(s, sub string) bool {
-	for i := 0; i <= len(s)-len(sub); i++ {
-		if s[i:i+len(sub)] == sub {
-			return true
-		}
-	}
-	return false
 }
