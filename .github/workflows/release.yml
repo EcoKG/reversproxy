@@ -1,0 +1,83 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.output }}
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - cmd: winclient
+            goos: windows
+            goarch: amd64
+            cgo: "1"
+            cc: x86_64-w64-mingw32-gcc
+            output: reversproxy-client-windows-amd64.exe
+            ldflags: "-H windowsgui -s -w"
+          - cmd: client
+            goos: linux
+            goarch: amd64
+            cgo: "0"
+            output: reversproxy-client-linux-amd64
+            ldflags: "-s -w"
+          - cmd: client
+            goos: linux
+            goarch: arm64
+            cgo: "0"
+            output: reversproxy-client-linux-arm64
+            ldflags: "-s -w"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Install MinGW (Windows cross-compile)
+        if: matrix.cgo == '1'
+        run: sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: ${{ matrix.cgo }}
+          CC: ${{ matrix.cc }}
+        run: |
+          go build -ldflags "${{ matrix.ldflags }}" -o ${{ matrix.output }} ./cmd/${{ matrix.cmd }}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.output }}
+          path: ${{ matrix.output }}
+
+  release:
+    name: Create Release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            reversproxy-client-windows-amd64.exe
+            reversproxy-client-linux-amd64
+            reversproxy-client-linux-arm64
+          generate_release_notes: true

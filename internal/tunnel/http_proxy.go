@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 )
 
@@ -28,7 +30,7 @@ var LastHTTPAddr string
 //
 // This design keeps TLS termination and HTTP parsing at the client side for
 // HTTPS tunnels; plain-HTTP tunnels are fully relayed at the TCP level.
-func StartHTTPProxy(ctx context.Context, addr string, mgr *Manager, ctrlConns *ControlConnRegistry, dataAddr string, log *slog.Logger) error {
+func StartHTTPProxy(ctx context.Context, addr string, mgr *Manager, ctrlConns *ControlConnRegistry, dataAddr string, log *slog.Logger, lim ...*Limiter) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return fmt.Errorf("http proxy: listen %s: %w", addr, err)
@@ -45,6 +47,11 @@ func StartHTTPProxy(ctx context.Context, addr string, mgr *Manager, ctrlConns *C
 			_ = ln.Close()
 		}()
 
+		var rl *Limiter
+		if len(lim) > 0 {
+			rl = lim[0]
+		}
+
 		for {
 			conn, err := ln.Accept()
 			if err != nil {
@@ -55,6 +62,26 @@ func StartHTTPProxy(ctx context.Context, addr string, mgr *Manager, ctrlConns *C
 				}
 				return
 			}
+
+			if rl != nil {
+				ip, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
+				if !rl.Allow(ip) {
+					log.Warn("HTTP proxy: rate limited", "ip", ip)
+					conn.Close()
+					continue
+				}
+				if !rl.Acquire() {
+					log.Warn("HTTP proxy: max concurrent connections", "ip", ip)
+					conn.Close()
+					continue
+				}
+				go func() {
+					defer rl.Release()
+					handleHTTPConn(ctx, conn, mgr, ctrlConns, dataAddr, log)
+				}()
+				continue
+			}
+
 			go handleHTTPConn(ctx, conn, mgr, ctrlConns, dataAddr, log)
 		}
 	}()
@@ -78,7 +105,7 @@ func handleHTTPConn(
 	}()
 
 	// Set a deadline for reading the initial HTTP request.
-	_ = extConn.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = extConn.SetDeadline(time.Now().Add(config.ProxyReadTimeout))
 
 	// Use a bufio reader so we can peek without consuming bytes.
 	br := bufio.NewReader(extConn)
@@ -134,8 +161,17 @@ func handleHTTPConn(
 	// Rebuild the raw HTTP request bytes from the parsed request so we can
 	// replay them into the data connection. We use a pipe: write the request
 	// back to a net.Conn-compatible buffer.
-	rawReqBuf := &peekBuffer{}
-	_ = req.Write(rawReqBuf)
+	var rawReqBuf bytes.Buffer
+	_ = req.Write(&rawReqBuf)
+
+	// If the bufio.Reader has buffered bytes beyond the HTTP request (e.g.,
+	// pipelined data or a request body), append them so nothing is lost.
+	if br.Buffered() > 0 {
+		remaining, _ := br.Peek(br.Buffered())
+		rawReqBuf.Write(remaining)
+		// Discard the peeked bytes from the reader so they aren't read again.
+		_, _ = br.Discard(len(remaining))
+	}
 
 	// Register the pending connection (external conn) before sending OpenConnection.
 	pending := mgr.RegisterPending(connID, extConn)
@@ -167,7 +203,7 @@ func relayHTTPConn(ctx context.Context, pending *pendingConn, connID string, raw
 	var dataConn net.Conn
 	select {
 	case dataConn = <-waitDone:
-	case <-time.After(15 * time.Second):
+	case <-time.After(config.DataConnWaitTimeout):
 		log.Warn("HTTP proxy: timeout waiting for data conn", "connID", connID)
 		PendingExtConn(pending).Close()
 		return
@@ -191,23 +227,7 @@ func relayHTTPConn(ctx context.Context, pending *pendingConn, connID string, raw
 
 	log.Info("HTTP proxy: relay started", "connID", connID)
 
-	done := make(chan struct{}, 2)
-
-	go func() {
-		copyAndClose(dataConn, extConn)
-		done <- struct{}{}
-	}()
-
-	go func() {
-		copyAndClose(extConn, dataConn)
-		done <- struct{}{}
-	}()
-
-	<-done
-	<-done
-
-	extConn.Close()
-	dataConn.Close()
+	RelayBiDirectional(ctx, extConn, dataConn)
 
 	log.Info("HTTP proxy: relay finished", "connID", connID)
 }
@@ -220,15 +240,3 @@ func writeHTTPError(conn net.Conn, code int, msg string) {
 	_, _ = conn.Write([]byte(resp))
 }
 
-// peekBuffer is a simple byte buffer that implements io.Writer for capturing
-// the re-serialised HTTP request.
-type peekBuffer struct {
-	data []byte
-}
-
-func (p *peekBuffer) Write(b []byte) (int, error) {
-	p.data = append(p.data, b...)
-	return len(b), nil
-}
-
-func (p *peekBuffer) Bytes() []byte { return p.data }

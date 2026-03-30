@@ -33,7 +33,7 @@ func StartPortForward(
 	log *slog.Logger,
 ) error {
 	if bindAddr == "" {
-		bindAddr = "0.0.0.0"
+		bindAddr = "127.0.0.1"
 	}
 	addr := fmt.Sprintf("%s:%d", bindAddr, localPort)
 
@@ -125,63 +125,7 @@ func handlePortForward(
 
 	log.Info("port forward: relay started", "connID", connID, "target", target)
 
-	// Bidirectional relay: local conn ↔ mux channel
-	outSend := make(chan []byte, 64)
-	muxDone := make(chan struct{})
-
-	// Local → server
-	go func() {
-		defer close(outSend)
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := conn.Read(buf)
-			if n > 0 {
-				payload := make([]byte, n)
-				copy(payload, buf[:n])
-				outSend <- payload
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	// Server → local
-	recvDone := make(chan struct{})
-	go func() {
-		defer close(recvDone)
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := ch.Recv.Read(buf)
-			if n > 0 {
-				if _, werr := conn.Write(buf[:n]); werr != nil {
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	// Mux writer
-	go func() {
-		defer close(muxDone)
-		for payload := range outSend {
-			if err := cw.WriteMsg(protocol.MsgSOCKSData, protocol.SOCKSData{
-				ConnID:  connID,
-				Payload: payload,
-			}); err != nil {
-				for range outSend {
-				}
-				return
-			}
-		}
-	}()
-
-	<-muxDone
-	_ = cw.WriteMsg(protocol.MsgSOCKSClose, protocol.SOCKSClose{ConnID: connID})
-	<-recvDone
+	_ = tunnel.RelayMuxChannel(ctx, conn, conn, ch, ctrlWriterAdapter{cw}, connID, protocol.MsgSOCKSClose, log)
 
 	log.Info("port forward: relay finished", "connID", connID, "target", target)
 }

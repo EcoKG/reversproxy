@@ -234,69 +234,8 @@ func handleHTTPConnectConn(
 
 	log.Info("http connect proxy: relay started", "connID", connID, "target", target)
 
-	// outSend carries payloads from the local HTTP client to the mux writer.
-	outSend := make(chan []byte, 64)
-	muxWriterDone := make(chan struct{})
-
-	// Goroutine A: local HTTP client → server via MsgSOCKSData
-	go func() {
-		defer close(outSend)
-		// Use the buffered reader so we don't lose bytes already buffered
-		// during header parsing.
-		buf := make([]byte, 32*1024)
-		for {
-			n, rerr := br.Read(buf)
-			if n > 0 {
-				payload := make([]byte, n)
-				copy(payload, buf[:n])
-				outSend <- payload
-			}
-			if rerr != nil {
-				return
-			}
-		}
-	}()
-
-	// Goroutine B: server → local HTTP client via ch.Recv (MsgSOCKSData)
-	recvDone := make(chan struct{})
-	go func() {
-		defer close(recvDone)
-		buf := make([]byte, 32*1024)
-		for {
-			n, rerr := ch.Recv.Read(buf)
-			if n > 0 {
-				if _, werr := conn.Write(buf[:n]); werr != nil {
-					return
-				}
-			}
-			if rerr != nil {
-				return
-			}
-		}
-	}()
-
-	// Mux writer: drains outSend → MsgSOCKSData to server
-	go func() {
-		defer close(muxWriterDone)
-		for payload := range outSend {
-			if err := cw.WriteMsg(protocol.MsgSOCKSData, protocol.SOCKSData{
-				ConnID:  connID,
-				Payload: payload,
-			}); err != nil {
-				for range outSend {
-				} // drain to unblock goroutine A
-				return
-			}
-		}
-	}()
-
-	// Wait until goroutine A has finished reading AND the mux writer has
-	// sent all data to the server.
-	<-muxWriterDone
-	_ = cw.WriteMsg(protocol.MsgSOCKSClose, protocol.SOCKSClose{ConnID: connID})
-
-	// Wait for the server to finish sending (goroutine B exits on DeliverClose).
-	<-recvDone
+	// r=br (bufio.Reader) so pre-buffered header bytes are not lost; w=conn.
+	_ = tunnel.RelayMuxChannel(ctx, br, conn, ch, ctrlWriterAdapter{cw}, connID, protocol.MsgSOCKSClose, log)
 
 	mux.Remove(connID)
 	log.Info("http connect proxy: relay finished", "connID", connID)

@@ -1,10 +1,11 @@
 package tunnel
 
 import (
+	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
+	"time"
 
 	"github.com/EcoKG/reversproxy/internal/protocol"
 )
@@ -44,37 +45,50 @@ func handleSOCKSConnectAsync(
 	targetConn, err := net.Dial("tcp", targetAddr)
 	if err != nil {
 		log.Warn("SOCKS: failed to dial target", "target", targetAddr, "err", err)
-		// Report failure to server via control channel.
-		_ = protocol.WriteMessage(ctrlConn, protocol.MsgSOCKSReady, protocol.SOCKSReady{
+		if werr := protocol.WriteMessage(ctrlConn, protocol.MsgSOCKSReady, protocol.SOCKSReady{
 			ConnID:  msg.ConnID,
 			Success: false,
 			Error:   err.Error(),
-		})
+		}); werr != nil {
+			log.Debug("failed to send SOCKSReady failure", "err", werr)
+		}
 		return nil // not a fatal error for the goroutine
 	}
 	defer targetConn.Close()
+	if tc, ok := targetConn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(15 * time.Second)
+	}
 
 	// 2. Open a data connection back to the server.
 	dataConn, err := net.Dial("tcp", serverDataAddr)
 	if err != nil {
-		_ = protocol.WriteMessage(ctrlConn, protocol.MsgSOCKSReady, protocol.SOCKSReady{
+		if werr := protocol.WriteMessage(ctrlConn, protocol.MsgSOCKSReady, protocol.SOCKSReady{
 			ConnID:  msg.ConnID,
 			Success: false,
 			Error:   fmt.Sprintf("dial server data addr: %v", err),
-		})
+		}); werr != nil {
+			log.Debug("failed to send SOCKSReady failure", "err", werr)
+		}
 		return nil
 	}
 	defer dataConn.Close()
+	if tc, ok := dataConn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(15 * time.Second)
+	}
 
 	// 3. Identify this data connection to the server.
 	if err := protocol.WriteMessage(dataConn, protocol.MsgDataConnHello, protocol.DataConnHello{
 		ConnID: msg.ConnID,
 	}); err != nil {
-		_ = protocol.WriteMessage(ctrlConn, protocol.MsgSOCKSReady, protocol.SOCKSReady{
+		if werr := protocol.WriteMessage(ctrlConn, protocol.MsgSOCKSReady, protocol.SOCKSReady{
 			ConnID:  msg.ConnID,
 			Success: false,
 			Error:   fmt.Sprintf("send DataConnHello: %v", err),
-		})
+		}); werr != nil {
+			log.Debug("failed to send SOCKSReady failure", "err", werr)
+		}
 		return nil
 	}
 
@@ -89,26 +103,7 @@ func handleSOCKSConnectAsync(
 	log.Info("SOCKS relay started (client side)", "target", targetAddr)
 
 	// 5. Bidirectional relay between target and server data connection.
-	done := make(chan struct{}, 2)
-
-	go func() {
-		_, _ = io.Copy(targetConn, dataConn)
-		if tc, ok := targetConn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
-
-	go func() {
-		_, _ = io.Copy(dataConn, targetConn)
-		if tc, ok := dataConn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
-
-	<-done
-	<-done
+	RelayBiDirectional(context.Background(), targetConn, dataConn)
 
 	log.Info("SOCKS relay finished (client side)")
 	return nil
@@ -145,6 +140,10 @@ func handleOpenConnAsync(msg protocol.OpenConnection, serverDataAddr string, log
 	defer func() {
 		dataConn.Close()
 	}()
+	if tc, ok := dataConn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(15 * time.Second)
+	}
 
 	// 2. Send DataConnHello.
 	if err := protocol.WriteMessage(dataConn, protocol.MsgDataConnHello, protocol.DataConnHello{
@@ -161,36 +160,15 @@ func handleOpenConnAsync(msg protocol.OpenConnection, serverDataAddr string, log
 		return fmt.Errorf("dial local service %q: %w", localAddr, err)
 	}
 	defer localConn.Close()
+	if tc, ok := localConn.(*net.TCPConn); ok {
+		_ = tc.SetKeepAlive(true)
+		_ = tc.SetKeepAlivePeriod(15 * time.Second)
+	}
 
 	log.Info("relay started (client side)", "localAddr", localAddr)
 
 	// 4. Bidirectional relay.
-	done := make(chan struct{}, 2)
-
-	go func() {
-		_, err := io.Copy(localConn, dataConn)
-		if err != nil && !isClosedErr(err) {
-			log.Debug("relay server→local done", "err", err)
-		}
-		if tc, ok := localConn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
-
-	go func() {
-		_, err := io.Copy(dataConn, localConn)
-		if err != nil && !isClosedErr(err) {
-			log.Debug("relay local→server done", "err", err)
-		}
-		if tc, ok := dataConn.(*net.TCPConn); ok {
-			_ = tc.CloseWrite()
-		}
-		done <- struct{}{}
-	}()
-
-	<-done
-	<-done
+	RelayBiDirectional(context.Background(), localConn, dataConn)
 
 	log.Info("relay finished (client side)")
 	return nil

@@ -68,11 +68,11 @@ func startHTTPInfra(t *testing.T) *httpTestInfra {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Data listener.
-	if err := tunnel.StartDataListener(ctx, "127.0.0.1:0", mgr, log); err != nil {
+	dataAddr, err := tunnel.StartDataListener(ctx, "127.0.0.1:0", mgr, log)
+	if err != nil {
 		cancel()
 		t.Fatalf("StartDataListener: %v", err)
 	}
-	dataAddr := tunnel.DataAddr
 
 	// HTTP proxy.
 	if err := tunnel.StartHTTPProxy(ctx, "127.0.0.1:0", mgr, ctrlConns, dataAddr, log); err != nil {

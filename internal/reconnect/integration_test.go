@@ -156,7 +156,8 @@ func (s *restartableServer) dialClient(clientAddr string) {
 	mgr := tunnel.NewManager()
 	log := logger.New("test-server")
 
-	if err := tunnel.StartDataListener(ctx, "127.0.0.1:0", mgr, log); err != nil {
+	dataAddr, err := tunnel.StartDataListener(ctx, "127.0.0.1:0", mgr, log)
+	if err != nil {
 		cancel()
 		s.t.Fatalf("StartDataListener: %v", err)
 	}
@@ -165,7 +166,7 @@ func (s *restartableServer) dialClient(clientAddr string) {
 	s.cancel = cancel
 	s.reg = reg
 	s.mgr = mgr
-	s.dataAddr = tunnel.DataAddr
+	s.dataAddr = dataAddr
 	s.mu.Unlock()
 
 	tlsCfg := control.NewClientTLSConfig(true)
@@ -175,7 +176,7 @@ func (s *restartableServer) dialClient(clientAddr string) {
 			cancel()
 			return
 		}
-		control.HandleControlConn(ctx, conn, reg, "secret", log, mgr, tunnel.DataAddr)
+		control.HandleControlConn(ctx, conn, reg, "secret", log, mgr, dataAddr)
 	}()
 }
 

@@ -7,24 +7,45 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"sync"
 )
+
+// encPool reuses bytes.Buffer allocations across WriteMessage calls to reduce
+// GC pressure on high-throughput control connections.
+var encPool = sync.Pool{New: func() any { return new(bytes.Buffer) }}
+
+// Decode is a generic helper that decodes a gob-encoded payload into T,
+// eliminating per-call boilerplate across the codebase.
+func Decode[T any](payload []byte) (T, error) {
+	var v T
+	if err := gob.NewDecoder(bytes.NewReader(payload)).Decode(&v); err != nil {
+		return v, err
+	}
+	return v, nil
+}
 
 // WriteMessage encodes payload using gob, wraps it in an Envelope, and writes
 // the frame to conn with a 4-byte big-endian length prefix.
 func WriteMessage(conn net.Conn, msgType MsgType, payload any) error {
-	// Encode payload into bytes.
-	var payloadBuf bytes.Buffer
-	if err := gob.NewEncoder(&payloadBuf).Encode(payload); err != nil {
+	// Acquire a pooled buffer for the payload encoding.
+	payloadBuf := encPool.Get().(*bytes.Buffer)
+	payloadBuf.Reset()
+	defer encPool.Put(payloadBuf)
+
+	if err := gob.NewEncoder(payloadBuf).Encode(payload); err != nil {
 		return fmt.Errorf("framing: encode payload: %w", err)
 	}
 
-	// Build Envelope and encode it.
+	// Build Envelope and encode it into a second pooled buffer.
 	env := Envelope{
 		Type:    msgType,
 		Payload: payloadBuf.Bytes(),
 	}
-	var envBuf bytes.Buffer
-	if err := gob.NewEncoder(&envBuf).Encode(env); err != nil {
+	envBuf := encPool.Get().(*bytes.Buffer)
+	envBuf.Reset()
+	defer encPool.Put(envBuf)
+
+	if err := gob.NewEncoder(envBuf).Encode(env); err != nil {
 		return fmt.Errorf("framing: encode envelope: %w", err)
 	}
 

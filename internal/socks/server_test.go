@@ -46,11 +46,11 @@ func startTestEnv(t *testing.T, authUser, authPass string) (*testEnv, func()) {
 	log := logger.New("test-socks")
 
 	// Start the data listener.
-	if err := tunnel.StartDataListener(ctx, "127.0.0.1:0", mgr, log); err != nil {
+	dataAddr, err := tunnel.StartDataListener(ctx, "127.0.0.1:0", mgr, log)
+	if err != nil {
 		cancel()
 		t.Fatalf("StartDataListener: %v", err)
 	}
-	dataAddr := tunnel.DataAddr
 
 	// Start the SOCKS5 proxy.
 	if err := socks.StartSOCKSProxy(ctx, "127.0.0.1:0", mgr, ctrlConns, dataAddr, log, authUser, authPass); err != nil {
@@ -612,10 +612,10 @@ func TestSOCKS5_WithRealClientHandler(t *testing.T) {
 	ctrlConns := tunnel.NewControlConnRegistry()
 	log := logger.New("test-real")
 
-	if err := tunnel.StartDataListener(ctx, "127.0.0.1:0", mgr, log); err != nil {
+	dataAddr, err := tunnel.StartDataListener(ctx, "127.0.0.1:0", mgr, log)
+	if err != nil {
 		t.Fatalf("StartDataListener: %v", err)
 	}
-	dataAddr := tunnel.DataAddr
 
 	if err := socks.StartSOCKSProxy(ctx, "127.0.0.1:0", mgr, ctrlConns, dataAddr, log, "", ""); err != nil {
 		t.Fatalf("StartSOCKSProxy: %v", err)
