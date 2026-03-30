@@ -30,6 +30,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
@@ -122,7 +123,7 @@ func handleSOCKSConn(
 ) {
 	defer conn.Close()
 
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(config.SOCKSHandshakeTimeout))
 
 	targetHost, targetPort, err := NegotiateSOCKS5(conn, authUser, authPass, log)
 	if err != nil {
@@ -187,7 +188,7 @@ func handleSOCKSConn(
 	var ready readyResult
 	select {
 	case ready = <-readyCh:
-	case <-time.After(30 * time.Second):
+	case <-time.After(config.SOCKSReadyTimeout):
 		log.Warn("socks5: timeout waiting for client dial", "connID", connID)
 		sendSOCKSReply(conn, repGeneralFailure, nil, 0)
 		return
@@ -218,7 +219,7 @@ func handleSOCKSConn(
 	var dataConn net.Conn
 	select {
 	case dataConn = <-dataCh:
-	case <-time.After(15 * time.Second):
+	case <-time.After(config.DataConnWaitTimeout):
 		log.Warn("socks5: timeout waiting for data conn", "connID", connID)
 		sendSOCKSReply(conn, repGeneralFailure, nil, 0)
 		return

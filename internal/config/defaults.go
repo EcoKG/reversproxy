@@ -17,6 +17,9 @@ const (
 	// is considered stale.
 	HeartbeatStaleThreshold = 30 * time.Second
 
+	// PongTimeout is the maximum time to wait for a Pong response.
+	PongTimeout = 10 * time.Second
+
 	// DataConnWaitTimeout is how long proxy handlers wait for a client's data
 	// connection to arrive before giving up.
 	DataConnWaitTimeout = 15 * time.Second

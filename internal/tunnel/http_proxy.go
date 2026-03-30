@@ -2,6 +2,7 @@ package tunnel
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"fmt"
 	"log/slog"
@@ -10,6 +11,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 )
 
@@ -103,7 +105,7 @@ func handleHTTPConn(
 	}()
 
 	// Set a deadline for reading the initial HTTP request.
-	_ = extConn.SetDeadline(time.Now().Add(10 * time.Second))
+	_ = extConn.SetDeadline(time.Now().Add(config.ProxyReadTimeout))
 
 	// Use a bufio reader so we can peek without consuming bytes.
 	br := bufio.NewReader(extConn)
@@ -159,8 +161,8 @@ func handleHTTPConn(
 	// Rebuild the raw HTTP request bytes from the parsed request so we can
 	// replay them into the data connection. We use a pipe: write the request
 	// back to a net.Conn-compatible buffer.
-	rawReqBuf := &peekBuffer{}
-	_ = req.Write(rawReqBuf)
+	var rawReqBuf bytes.Buffer
+	_ = req.Write(&rawReqBuf)
 
 	// If the bufio.Reader has buffered bytes beyond the HTTP request (e.g.,
 	// pipelined data or a request body), append them so nothing is lost.
@@ -201,7 +203,7 @@ func relayHTTPConn(ctx context.Context, pending *pendingConn, connID string, raw
 	var dataConn net.Conn
 	select {
 	case dataConn = <-waitDone:
-	case <-time.After(15 * time.Second):
+	case <-time.After(config.DataConnWaitTimeout):
 		log.Warn("HTTP proxy: timeout waiting for data conn", "connID", connID)
 		PendingExtConn(pending).Close()
 		return
@@ -238,15 +240,3 @@ func writeHTTPError(conn net.Conn, code int, msg string) {
 	_, _ = conn.Write([]byte(resp))
 }
 
-// peekBuffer is a simple byte buffer that implements io.Writer for capturing
-// the re-serialised HTTP request.
-type peekBuffer struct {
-	data []byte
-}
-
-func (p *peekBuffer) Write(b []byte) (int, error) {
-	p.data = append(p.data, b...)
-	return len(b), nil
-}
-
-func (p *peekBuffer) Bytes() []byte { return p.data }

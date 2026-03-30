@@ -5,13 +5,12 @@ import (
 	"log/slog"
 	"time"
 
+	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 )
 
 const (
-	pingInterval = 30 * time.Second
-	pongTimeout  = 10 * time.Second
-	maxMissed    = 2
+	maxMissed = 2
 )
 
 // StartHeartbeat sends periodic Ping messages to the client and tracks missed
@@ -22,7 +21,7 @@ const (
 // It must be called in its own goroutine; it returns when either ctx is
 // cancelled (normal shutdown) or the miss limit is exceeded.
 func StartHeartbeat(ctx context.Context, client *Client, log *slog.Logger) {
-	ticker := time.NewTicker(pingInterval)
+	ticker := time.NewTicker(config.HeartbeatInterval)
 	defer ticker.Stop()
 
 	missed := 0
@@ -37,7 +36,7 @@ func StartHeartbeat(ctx context.Context, client *Client, log *slog.Logger) {
 			// If the last heartbeat acknowledgement is older than
 			// pingInterval*(maxMissed+1) AND we have already fired maxMissed
 			// unanswered pings, treat the connection as dead.
-			if time.Since(client.LastHeartbeat()) > pingInterval*time.Duration(maxMissed+1) && missed >= maxMissed {
+			if time.Since(client.LastHeartbeat()) > config.HeartbeatInterval*time.Duration(maxMissed+1) && missed >= maxMissed {
 				log.Warn("heartbeat timeout", "id", client.ID)
 				client.cancelFn()
 				return

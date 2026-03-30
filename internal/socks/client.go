@@ -19,13 +19,13 @@ package socks
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
@@ -38,6 +38,13 @@ var LastClientSOCKSAddr string
 // server's control connection.  It must be safe for concurrent use.
 type ControlWriter interface {
 	WriteMsg(msgType protocol.MsgType, payload any) error
+}
+
+// ctrlWriterAdapter bridges ControlWriter (WriteMsg) to tunnel.CtrlWriter (Write).
+type ctrlWriterAdapter struct{ cw ControlWriter }
+
+func (a ctrlWriterAdapter) Write(msgType protocol.MsgType, payload any) error {
+	return a.cw.WriteMsg(msgType, payload)
 }
 
 // StartClientSOCKSProxy starts the CLIENT-side SOCKS5 listener on addr.
@@ -98,7 +105,7 @@ func handleClientSOCKSConn(
 ) {
 	defer conn.Close()
 
-	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
+	_ = conn.SetDeadline(time.Now().Add(config.SOCKSHandshakeTimeout))
 
 	targetHost, targetPort, err := NegotiateSOCKS5(conn, authUser, authPass, log)
 	if err != nil {
@@ -146,7 +153,7 @@ func handleClientSOCKSConn(
 	var ready tunnel.SOCKSReadyResult
 	select {
 	case ready = <-ch.ReadyCh:
-	case <-time.After(30 * time.Second):
+	case <-time.After(config.SOCKSReadyTimeout):
 		log.Warn("socks5 client: timeout waiting for server dial", "connID", connID)
 		sendSOCKSReply(conn, repGeneralFailure, nil, 0)
 		return
@@ -179,73 +186,7 @@ func handleClientSOCKSConn(
 		"target", fmt.Sprintf("%s:%d", targetHost, targetPort),
 	)
 
-	// outSend carries payloads from the local SOCKS client to the mux writer.
-	outSend := make(chan []byte, 64)
-	muxWriterDone := make(chan struct{})
-
-	// Goroutine A: local SOCKS client → server
-	// Reads from conn, pumps payloads into outSend.
-	// Closes outSend when the local conn reaches EOF / CloseWrite.
-	go func() {
-		defer close(outSend)
-		buf := make([]byte, 32*1024)
-		for {
-			n, err := conn.Read(buf)
-			if n > 0 {
-				payload := make([]byte, n)
-				copy(payload, buf[:n])
-				select {
-				case outSend <- payload:
-				case <-ctx.Done():
-					return
-				}
-			}
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	// Goroutine B: server → local SOCKS client
-	// Reads from ch.Recv (MsgSOCKSData from server), writes to conn.
-	// Exits when ch.Recv returns EOF (recvW closed by mux.Remove / DeliverClose).
-	recvDone := make(chan struct{})
-	go func() {
-		defer close(recvDone)
-		_, _ = io.Copy(conn, ch.Recv)
-	}()
-
-	// Mux writer: drains outSend → MsgSOCKSData to server.
-	// Exits after outSend is closed (goroutine A finished).
-	go func() {
-		defer close(muxWriterDone)
-		for payload := range outSend {
-			if err := cw.WriteMsg(protocol.MsgSOCKSData, protocol.SOCKSData{
-				ConnID:  connID,
-				Payload: payload,
-			}); err != nil {
-				for range outSend {
-				} // drain to unblock goroutine A
-				return
-			}
-		}
-	}()
-
-	// Half-close sequence:
-	//   1. Wait until goroutine A has finished reading AND the mux writer has
-	//      sent all data to the server.
-	//   2. Send MsgSOCKSClose — tells the server we won't send any more data.
-	//   3. The server will eventually echo back remaining data and then send
-	//      its own MsgSOCKSClose.
-	//   4. The client dispatcher receives MsgSOCKSClose → calls
-	//      clientMux.DeliverClose(connID) → closes ch.recvW → goroutine B
-	//      gets EOF from ch.Recv and exits.
-	//   5. Wait for goroutine B.
-	<-muxWriterDone
-	_ = cw.WriteMsg(protocol.MsgSOCKSClose, protocol.SOCKSClose{ConnID: connID})
-
-	// Wait for the server to finish sending (goroutine B exits on DeliverClose).
-	<-recvDone
+	_ = tunnel.RelayMuxChannel(ctx, conn, conn, ch, ctrlWriterAdapter{cw}, connID, protocol.MsgSOCKSClose, log)
 
 	// Final cleanup: remove the channel from the mux (idempotent if already
 	// removed by DeliverClose).
