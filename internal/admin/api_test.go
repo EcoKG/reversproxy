@@ -391,3 +391,131 @@ func TestStats_CountedReaderWriter(t *testing.T) {
 		t.Errorf("tunnel BytesOut: got %d, want 10", ts.BytesOut.Load())
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Task 3.6 — Auth middleware tests
+// ---------------------------------------------------------------------------
+
+// startAdminEnvWithToken starts an admin server that requires a Bearer token.
+func startAdminEnvWithToken(t *testing.T, token string) *adminTestEnv {
+	t.Helper()
+
+	reg := control.NewClientRegistry()
+	mgr := tunnel.NewManager()
+	statsReg := stats.NewRegistry()
+	global := &stats.ServerStats{}
+	log := logger.New("test-admin-auth")
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	srv := admin.New(reg, mgr, statsReg, global, log, token)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		cancel()
+		t.Fatalf("net.Listen: %v", err)
+	}
+	addr := ln.Addr().String()
+
+	if err := srv.StartWithListener(ctx, ln); err != nil {
+		cancel()
+		t.Fatalf("admin.StartWithListener: %v", err)
+	}
+
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for time.Now().Before(deadline) {
+		req, _ := http.NewRequest(http.MethodGet, fmt.Sprintf("http://%s/api/stats", addr), nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		resp, err := http.DefaultClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	return &adminTestEnv{
+		reg:      reg,
+		mgr:      mgr,
+		statsReg: statsReg,
+		global:   global,
+		baseURL:  fmt.Sprintf("http://%s", addr),
+		cancel:   cancel,
+	}
+}
+
+// getWithAuth performs a GET to path with the provided Bearer token and returns
+// the HTTP status code.
+func getWithAuth(t *testing.T, baseURL, path, token string) int {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, baseURL+path, nil)
+	if err != nil {
+		t.Fatalf("http.NewRequest: %v", err)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
+// TestAuthMiddleware_ValidToken verifies that a valid Bearer token returns 200.
+func TestAuthMiddleware_ValidToken(t *testing.T) {
+	const token = "supersecret"
+	env := startAdminEnvWithToken(t, token)
+	defer env.cancel()
+
+	code := getWithAuth(t, env.baseURL, "/api/stats", token)
+	if code != http.StatusOK {
+		t.Errorf("valid token: got %d, want %d", code, http.StatusOK)
+	}
+}
+
+// TestAuthMiddleware_EmptyToken verifies that when no token is configured,
+// requests without Authorization headers are allowed.
+func TestAuthMiddleware_EmptyToken(t *testing.T) {
+	// Server with empty token = no auth required.
+	env := startAdminEnv(t)
+	defer env.cancel()
+
+	code := getWithAuth(t, env.baseURL, "/api/stats", "")
+	if code != http.StatusOK {
+		t.Errorf("no-auth server: got %d, want %d", code, http.StatusOK)
+	}
+}
+
+// TestAuthMiddleware_InvalidScheme verifies that a non-Bearer Authorization
+// header is rejected with 401.
+func TestAuthMiddleware_InvalidScheme(t *testing.T) {
+	const token = "supersecret"
+	env := startAdminEnvWithToken(t, token)
+	defer env.cancel()
+
+	req, _ := http.NewRequest(http.MethodGet, env.baseURL+"/api/stats", nil)
+	req.Header.Set("Authorization", "Basic dXNlcjpwYXNz")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET /api/stats: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("invalid scheme: got %d, want %d", resp.StatusCode, http.StatusUnauthorized)
+	}
+}
+
+// TestAuthMiddleware_WrongToken verifies that an incorrect Bearer token is
+// rejected with 401.
+func TestAuthMiddleware_WrongToken(t *testing.T) {
+	const token = "supersecret"
+	env := startAdminEnvWithToken(t, token)
+	defer env.cancel()
+
+	code := getWithAuth(t, env.baseURL, "/api/stats", "wrongtoken")
+	if code != http.StatusUnauthorized {
+		t.Errorf("wrong token: got %d, want %d", code, http.StatusUnauthorized)
+	}
+}
