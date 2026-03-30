@@ -1,0 +1,1 @@
+const {execSync}=require('child_process');try{const r=execSync('go test ./internal/app/... 2>&1',{cwd:'/home/starlyn/reversproxy',encoding:'utf8'});console.log(r);}catch(e){console.log(e.stdout);console.log(e.stderr);}
