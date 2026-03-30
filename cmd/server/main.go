@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -88,6 +89,17 @@ func main() {
 		"note",          "SOCKS5 listener is now on the CLIENT side",
 	)
 
+	// Warn if the default insecure token is in use.
+	if cfg.AuthToken == "changeme" {
+		log.Warn("SECURITY: auth_token is set to the default value 'changeme' — change it before deploying")
+	}
+	for _, cl := range cfg.Clients {
+		if cl.AuthToken == "changeme" {
+			log.Warn("SECURITY: client auth_token is set to the default value 'changeme'",
+				"client", cl.Name)
+		}
+	}
+
 	// ------------------------------------------------------------------ //
 	// TLS setup — used by the server when dialing clients
 	// ------------------------------------------------------------------ //
@@ -111,18 +123,16 @@ func main() {
 	defer cancel()
 
 	// Start the data connection listener.
-	if err := tunnel.StartDataListener(ctx, cfg.DataAddr, mgr, log); err != nil {
+	resolvedDataAddr, err := tunnel.StartDataListener(ctx, cfg.DataAddr, mgr, log)
+	if err != nil {
 		log.Error("failed to start data listener", "addr", cfg.DataAddr, "err", err)
 		os.Exit(1)
 	}
 
-	// dataAddr may have been :0 (OS-assigned); use the actual bound address.
-	resolvedDataAddr := tunnel.DataAddr
-
 	// Build rate limiter for proxy accept loops.
 	var proxyLimiter *tunnel.Limiter
 	if cfg.MaxConnRate > 0 || cfg.MaxConcurrent > 0 {
-		proxyLimiter = tunnel.NewLimiter(cfg.MaxConnRate, cfg.MaxConnBurst, cfg.MaxConcurrent)
+		proxyLimiter = tunnel.NewLimiter(cfg.MaxConnRate, cfg.MaxConnBurst, cfg.MaxConcurrent, 0)
 	}
 
 	// Start the HTTP host-based proxy.
@@ -177,7 +187,11 @@ func main() {
 	}
 
 	// Build TLS config for dialing clients.
-	clientTLSCfg := buildClientTLSConfig(cfg, log)
+	clientTLSCfg, err := buildClientTLSConfig(cfg, log)
+	if err != nil {
+		log.Error("failed to build client TLS config", "err", err)
+		os.Exit(1)
+	}
 
 	var wg sync.WaitGroup
 
@@ -309,36 +323,30 @@ func dialClientLoop(
 
 // buildClientTLSConfig builds a *tls.Config for the server's outbound
 // connections to clients based on the ServerConfig settings.
-func buildClientTLSConfig(cfg *config.ServerConfig, log *slog.Logger) *tls.Config {
+// Returns an error if a CA cert is configured but cannot be loaded/parsed.
+func buildClientTLSConfig(cfg *config.ServerConfig, log *slog.Logger) (*tls.Config, error) {
 	tlsCfg := &tls.Config{
 		MinVersion: tls.VersionTLS13,
 	}
 
 	if cfg.Insecure {
 		tlsCfg.InsecureSkipVerify = true //nolint:gosec // intentional: dev mode
-		return tlsCfg
+		return tlsCfg, nil
 	}
 
 	if cfg.ClientCACert != "" {
 		caCert, err := os.ReadFile(cfg.ClientCACert)
 		if err != nil {
-			log.Error("failed to read client CA cert", "path", cfg.ClientCACert, "err", err)
-			// Fall back to insecure
-			tlsCfg.InsecureSkipVerify = true //nolint:gosec
-			return tlsCfg
+			return nil, fmt.Errorf("failed to read client CA cert %q: %w", cfg.ClientCACert, err)
 		}
 		pool := x509.NewCertPool()
 		if !pool.AppendCertsFromPEM(caCert) {
-			log.Error("failed to parse client CA cert", "path", cfg.ClientCACert)
-			tlsCfg.InsecureSkipVerify = true //nolint:gosec
-			return tlsCfg
+			return nil, fmt.Errorf("failed to parse client CA cert %q: invalid PEM data", cfg.ClientCACert)
 		}
 		tlsCfg.RootCAs = pool
-		return tlsCfg
+		return tlsCfg, nil
 	}
 
-	// No CA cert configured and not insecure — default to insecure for
-	// backward compatibility with self-signed certs.
-	tlsCfg.InsecureSkipVerify = true //nolint:gosec
-	return tlsCfg
+	// No CA cert configured and not insecure — use system root CAs.
+	return tlsCfg, nil
 }

@@ -9,25 +9,22 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 )
-
-// DataAddr is the address (host:port) on which the server listens for
-// incoming data connections from clients. Clients dial this address after
-// receiving an OpenConnection message.
-var DataAddr string
 
 // StartDataListener starts the server-side data connection listener on addr.
 // When a client dials in, it sends a DataConnHello; the server looks up the
 // matching pendingConn and fulfils it so the relay can proceed.
-func StartDataListener(ctx context.Context, addr string, mgr *Manager, log *slog.Logger) error {
+// Returns the actual bound address (useful when addr uses port :0) and any error.
+func StartDataListener(ctx context.Context, addr string, mgr *Manager, log *slog.Logger) (string, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		return err
+		return "", err
 	}
 
-	DataAddr = ln.Addr().String()
-	log.Info("data listener started", "addr", DataAddr)
+	boundAddr := ln.Addr().String()
+	log.Info("data listener started", "addr", boundAddr)
 
 	go func() {
 		defer ln.Close()
@@ -55,15 +52,29 @@ func StartDataListener(ctx context.Context, addr string, mgr *Manager, log *slog
 		}
 	}()
 
-	return nil
+	return boundAddr, nil
 }
 
 // handleDataConn reads the DataConnHello from a client data connection and
 // fulfils the pending external connection so the relay can start.
 func handleDataConn(conn net.Conn, mgr *Manager, log *slog.Logger) {
+	// Apply a deadline for reading the handshake to avoid goroutine leaks.
+	if err := conn.SetDeadline(time.Now().Add(config.HandshakeTimeout)); err != nil {
+		log.Warn("data conn: failed to set deadline", "err", err)
+		conn.Close()
+		return
+	}
+
 	env, err := protocol.ReadMessage(conn)
 	if err != nil {
 		log.Warn("data conn: failed to read hello", "err", err)
+		conn.Close()
+		return
+	}
+
+	// Clear deadline for subsequent relay use.
+	if err := conn.SetDeadline(time.Time{}); err != nil {
+		log.Warn("data conn: failed to clear deadline", "err", err)
 		conn.Close()
 		return
 	}
@@ -90,6 +101,13 @@ func handleDataConn(conn net.Conn, mgr *Manager, log *slog.Logger) {
 	log.Info("data conn: fulfilled", "connID", hello.ConnID)
 }
 
+// CtrlWriter is a minimal interface for sending messages back to a client over
+// its control connection. Using an interface instead of *net.Conn allows the
+// caller to substitute a test double without a real TCP connection.
+type CtrlWriter interface {
+	Write(b []byte) (int, error)
+}
+
 // StartPublicListener opens a TCP listener on the requested public port and
 // begins accepting external connections for the given tunnel. For each
 // external connection it signals the client via the control connection and
@@ -99,7 +117,7 @@ func handleDataConn(conn net.Conn, mgr *Manager, log *slog.Logger) {
 func StartPublicListener(
 	ctx context.Context,
 	entry *TunnelEntry,
-	clientConn net.Conn,
+	clientConn CtrlWriter,
 	mgr *Manager,
 	log *slog.Logger,
 ) {
@@ -146,13 +164,15 @@ func StartPublicListener(
 		}
 
 		// Relay in a separate goroutine so we can continue accepting.
-		go relayExternalConn(ctx, pending, connID, log)
+		go relayExternalConn(ctx, pending, connID, mgr, log)
 	}
 }
 
 // relayExternalConn waits for the client's data connection to arrive and then
 // relays data bidirectionally between the external user and the client.
-func relayExternalConn(ctx context.Context, pending *pendingConn, connID string, log *slog.Logger) {
+// If the context is cancelled before the data connection arrives, the pending
+// entry is removed from the manager to avoid a map leak.
+func relayExternalConn(ctx context.Context, pending *pendingConn, connID string, mgr *Manager, log *slog.Logger) {
 	// Wait for the client to dial back with the matching data connection.
 	// Use a select with context so we don't block forever if the client dies.
 	waitDone := make(chan net.Conn, 1)
@@ -165,6 +185,7 @@ func relayExternalConn(ctx context.Context, pending *pendingConn, connID string,
 	case dataConn = <-waitDone:
 	case <-ctx.Done():
 		log.Warn("context cancelled while waiting for data conn", "connID", connID)
+		mgr.CancelPending(connID)
 		PendingExtConn(pending).Close()
 		return
 	}

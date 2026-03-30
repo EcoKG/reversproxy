@@ -62,11 +62,11 @@ func startInfra(t *testing.T) *testInfra {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// Start data listener on a random port.
-	if err := tunnel.StartDataListener(ctx, "127.0.0.1:0", reg, log); err != nil {
+	dataAddr, err := tunnel.StartDataListener(ctx, "127.0.0.1:0", reg, log)
+	if err != nil {
 		cancel()
 		t.Fatalf("StartDataListener: %v", err)
 	}
-	dataAddr := tunnel.DataAddr
 
 	tlsCfg := control.NewClientTLSConfig(true) // server dials with InsecureSkipVerify
 

@@ -50,18 +50,19 @@ func startAdminEnv(t *testing.T) *adminTestEnv {
 
 	srv := admin.New(reg, mgr, statsReg, global, log, "")
 
-	// Use :0 so the OS assigns a free port.
+	// Bind the listener first so that the port is reserved before the server
+	// starts — this eliminates the TOCTOU race between obtaining a free port
+	// and binding to it.
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		cancel()
 		t.Fatalf("net.Listen: %v", err)
 	}
 	addr := ln.Addr().String()
-	ln.Close() // release so Start can re-bind — we only need the port.
 
-	if err := srv.Start(ctx, addr); err != nil {
+	if err := srv.StartWithListener(ctx, ln); err != nil {
 		cancel()
-		t.Fatalf("admin.Start: %v", err)
+		t.Fatalf("admin.StartWithListener: %v", err)
 	}
 
 	// Wait for the server to be ready (up to 500 ms).

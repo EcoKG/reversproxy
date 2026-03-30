@@ -133,6 +133,15 @@ func (m *Manager) RegisterPending(connID string, extConn net.Conn) *pendingConn 
 	return p
 }
 
+// CancelPending removes a pending connection entry without fulfilling it.
+// This cleans up the map entry when the external conn is closed before the
+// client dials back (e.g. context cancelled, timeout).
+func (m *Manager) CancelPending(connID string) {
+	m.mu.Lock()
+	delete(m.pending, connID)
+	m.mu.Unlock()
+}
+
 // FulfillPending matches a client data connection to the waiting external
 // connection identified by connID. Returns an error if connID is unknown.
 func (m *Manager) FulfillPending(connID string, dataConn net.Conn) error {
@@ -165,7 +174,8 @@ func PendingExtConn(p *pendingConn) net.Conn {
 
 // AddHTTPTunnel registers a hostname for plain-HTTP routing.
 // Returns an error if the hostname is already registered by a different client.
-// If the same client re-registers a hostname, the old entry is replaced.
+// If the same client re-registers a hostname, the old entry is replaced without
+// duplicating the hostname in httpByClient.
 func (m *Manager) AddHTTPTunnel(tunnelID, clientID, hostname, localHost string, localPort int) (*HTTPTunnelEntry, error) {
 	entry := &HTTPTunnelEntry{
 		ID:        tunnelID,
@@ -180,15 +190,26 @@ func (m *Manager) AddHTTPTunnel(tunnelID, clientID, hostname, localHost string, 
 		m.mu.Unlock()
 		return nil, fmt.Errorf("hostname %q already registered by client %s", hostname, existing.ClientID)
 	}
+	// Only append to the per-client list if this hostname is not already tracked.
+	alreadyTracked := false
+	for _, h := range m.httpByClient[clientID] {
+		if h == hostname {
+			alreadyTracked = true
+			break
+		}
+	}
+	if !alreadyTracked {
+		m.httpByClient[clientID] = append(m.httpByClient[clientID], hostname)
+	}
 	m.httpTunnels[hostname] = entry
-	m.httpByClient[clientID] = append(m.httpByClient[clientID], hostname)
 	m.mu.Unlock()
 	return entry, nil
 }
 
 // AddHTTPSTunnel registers a hostname for HTTPS/SNI routing.
 // Returns an error if the hostname is already registered by a different client.
-// If the same client re-registers a hostname, the old entry is replaced.
+// If the same client re-registers a hostname, the old entry is replaced without
+// duplicating the hostname in httpsByClient.
 func (m *Manager) AddHTTPSTunnel(tunnelID, clientID, hostname, localHost string, localPort int) (*HTTPTunnelEntry, error) {
 	entry := &HTTPTunnelEntry{
 		ID:        tunnelID,
@@ -203,8 +224,18 @@ func (m *Manager) AddHTTPSTunnel(tunnelID, clientID, hostname, localHost string,
 		m.mu.Unlock()
 		return nil, fmt.Errorf("HTTPS hostname %q already registered by client %s", hostname, existing.ClientID)
 	}
+	// Only append to the per-client list if this hostname is not already tracked.
+	alreadyTracked := false
+	for _, h := range m.httpsByClient[clientID] {
+		if h == hostname {
+			alreadyTracked = true
+			break
+		}
+	}
+	if !alreadyTracked {
+		m.httpsByClient[clientID] = append(m.httpsByClient[clientID], hostname)
+	}
 	m.httpsTunnels[hostname] = entry
-	m.httpsByClient[clientID] = append(m.httpsByClient[clientID], hostname)
 	m.mu.Unlock()
 	return entry, nil
 }

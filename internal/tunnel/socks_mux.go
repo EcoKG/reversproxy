@@ -59,6 +59,7 @@ func (c *SOCKSChannel) Done() <-chan struct{} {
 type SOCKSMux struct {
 	mu       sync.RWMutex
 	channels map[string]*SOCKSChannel
+	wg       sync.WaitGroup
 }
 
 // NewSOCKSMux returns an initialised, empty mux.
@@ -88,6 +89,7 @@ func (m *SOCKSMux) NewChannel(connID string) (*SOCKSChannel, error) {
 	}
 
 	m.channels[connID] = ch
+	m.wg.Add(1)
 	return ch, nil
 }
 
@@ -103,6 +105,7 @@ func (m *SOCKSMux) Remove(connID string) {
 	if ok {
 		ch.Close()
 		_ = ch.recvW.Close()
+		m.wg.Done()
 	}
 }
 
@@ -153,6 +156,7 @@ func (m *SOCKSMux) DeliverClose(connID string) {
 	if ok {
 		ch.Close()
 		_ = ch.recvW.Close() // unblocks any pending Recv read with EOF
+		m.wg.Done()
 	}
 }
 
@@ -164,28 +168,16 @@ func (m *SOCKSMux) Get(connID string) *SOCKSChannel {
 	return ch
 }
 
-// DrainAndClose waits up to timeout for all channels to be removed by their
-// owners, then force-closes any that remain. This allows in-flight relays to
-// finish gracefully before a hard teardown.
+// DrainAndClose waits up to timeout for all channels to finish, then
+// force-closes any that remain. This allows in-flight relays to finish
+// gracefully before a hard teardown. It uses a WaitGroup instead of polling.
 func (m *SOCKSMux) DrainAndClose(timeout time.Duration) {
-	deadline := time.After(timeout)
-	ticker := time.NewTicker(50 * time.Millisecond)
-	defer ticker.Stop()
-
-	for {
-		m.mu.RLock()
-		n := len(m.channels)
-		m.mu.RUnlock()
-		if n == 0 {
-			return
-		}
-
-		select {
-		case <-deadline:
-			m.CloseAll()
-			return
-		case <-ticker.C:
-		}
+	done := make(chan struct{})
+	go func() { m.wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		m.CloseAll()
 	}
 }
 
@@ -202,5 +194,6 @@ func (m *SOCKSMux) CloseAll() {
 	for _, ch := range chs {
 		ch.Close()
 		_ = ch.recvW.Close()
+		m.wg.Done()
 	}
 }

@@ -131,6 +131,14 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 		return fmt.Errorf("admin: listen %s: %w", addr, err)
 	}
 
+	return s.StartWithListener(ctx, ln)
+}
+
+// StartWithListener starts the admin HTTP server using an already-bound
+// net.Listener. This eliminates the TOCTOU race that would otherwise occur
+// between obtaining a free port and binding to it.
+// The server is shut down when ctx is cancelled.
+func (s *Server) StartWithListener(ctx context.Context, ln net.Listener) error {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/clients", s.authMiddleware(s.handleClients))
 	mux.HandleFunc("/api/tunnels", s.authMiddleware(s.handleTunnels))
