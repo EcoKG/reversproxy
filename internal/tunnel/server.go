@@ -101,13 +101,6 @@ func handleDataConn(conn net.Conn, mgr *Manager, log *slog.Logger) {
 	log.Info("data conn: fulfilled", "connID", hello.ConnID)
 }
 
-// CtrlWriter is a minimal interface for sending messages back to a client over
-// its control connection. Using an interface instead of *net.Conn allows the
-// caller to substitute a test double without a real TCP connection.
-type CtrlWriter interface {
-	Write(b []byte) (int, error)
-}
-
 // StartPublicListener opens a TCP listener on the requested public port and
 // begins accepting external connections for the given tunnel. For each
 // external connection it signals the client via the control connection and
@@ -117,7 +110,7 @@ type CtrlWriter interface {
 func StartPublicListener(
 	ctx context.Context,
 	entry *TunnelEntry,
-	clientConn CtrlWriter,
+	clientConn net.Conn,
 	mgr *Manager,
 	log *slog.Logger,
 ) {

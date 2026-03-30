@@ -81,6 +81,10 @@ func main() {
 
 	log := logger.NewWithLevel("client", cfg.LogLevel)
 
+	if cfg.AuthToken == "changeme" {
+		log.Warn("security: default AuthToken 'changeme' is in use — change it for production")
+	}
+
 	// ------------------------------------------------------------------ //
 	// Build the tunnel configuration.
 	// Config-file tunnels take effect first; flag-based tunnels are appended.
