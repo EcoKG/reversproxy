@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/EcoKG/reversproxy/internal/admin"
@@ -169,7 +168,7 @@ func main() {
 	// Graceful shutdown signal handler
 	// ------------------------------------------------------------------ //
 	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sigCh, shutdownSignals...)
 
 	// ------------------------------------------------------------------ //
 	// Dial loop — server connects to each configured client
