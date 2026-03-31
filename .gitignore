@@ -5,12 +5,7 @@ dist/
 config.yaml
 
 # Vela Engine (auto-managed)
-.vela/cache/
-.vela/state/
-.vela/artifacts/
-.vela/tracker-signals.json
-.vela/write-log.jsonl
-*.vela-tmp
+.vela/
 
 # ── GSD baseline (auto-generated) ──
 .gsd
