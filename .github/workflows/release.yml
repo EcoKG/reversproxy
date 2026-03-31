@@ -34,6 +34,24 @@ jobs:
             cgo: "0"
             output: reversproxy-client-linux-arm64
             ldflags: "-s -w"
+          - cmd: server
+            goos: linux
+            goarch: amd64
+            cgo: "0"
+            output: reversproxy-server-linux-amd64
+            ldflags: "-s -w"
+          - cmd: server
+            goos: linux
+            goarch: arm64
+            cgo: "0"
+            output: reversproxy-server-linux-arm64
+            ldflags: "-s -w"
+          - cmd: server
+            goos: windows
+            goarch: amd64
+            cgo: "0"
+            output: reversproxy-server-windows-amd64.exe
+            ldflags: "-s -w"
 
     steps:
       - name: Checkout
@@ -80,4 +98,7 @@ jobs:
             reversproxy-client-windows-amd64.exe
             reversproxy-client-linux-amd64
             reversproxy-client-linux-arm64
+            reversproxy-server-linux-amd64
+            reversproxy-server-linux-arm64
+            reversproxy-server-windows-amd64.exe
           generate_release_notes: true
