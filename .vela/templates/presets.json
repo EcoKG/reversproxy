@@ -1,0 +1,40 @@
+{
+  "presets": {
+    "auth": {
+      "description": "인증 시스템 (OAuth, JWT, RBAC)",
+      "scale": "large",
+      "type": "code",
+      "request_template": "{project}에 인증 시스템 추가: {details}"
+    },
+    "api-crud": {
+      "description": "REST API CRUD 엔드포인트",
+      "scale": "medium",
+      "type": "code",
+      "request_template": "{resource} API CRUD 엔드포인트 구현"
+    },
+    "bugfix": {
+      "description": "버그 수정 (테스트 통과까지 반복)",
+      "scale": "ralph",
+      "type": "code-bug",
+      "request_template": "{description} 버그 수정"
+    },
+    "refactor": {
+      "description": "코드 리팩토링",
+      "scale": "large",
+      "type": "code-refactor",
+      "request_template": "{target} 리팩토링: {goals}"
+    },
+    "migration": {
+      "description": "데이터/스키마 마이그레이션",
+      "scale": "large",
+      "type": "code",
+      "request_template": "{source}에서 {target}으로 마이그레이션"
+    },
+    "docs": {
+      "description": "문서 작성/업데이트",
+      "scale": "small",
+      "type": "docs",
+      "request_template": "{target} 문서 작성"
+    }
+  }
+}
