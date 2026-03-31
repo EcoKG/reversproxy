@@ -9,6 +9,7 @@ import (
 	"context"
 	"crypto/tls"
 	_ "embed"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -65,9 +66,23 @@ func onReady() {
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("종료", "프로그램 종료")
 
-	// Determine config file path: same directory as the executable.
-	exePath, _ := os.Executable()
-	configPath := filepath.Join(filepath.Dir(exePath), "config.yaml")
+	// Determine exe directory; fall back to "." if os.Executable fails.
+	exePath, exeErr := os.Executable()
+	exeDir := "."
+	if exeErr == nil {
+		exeDir = filepath.Dir(exePath)
+	}
+	configPath := filepath.Join(exeDir, "config.yaml")
+
+	// Open log file next to the executable.
+	logPath := filepath.Join(exeDir, "winclient.log")
+	logFile, logErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if logErr != nil {
+		showError("Reversproxy", "로그 파일을 열 수 없습니다:\n"+logErr.Error())
+		return
+	}
+	defer logFile.Close()
+	log := slog.New(slog.NewTextHandler(logFile, nil))
 
 	// Root context; replaced per-connection by toggle.
 	rootCtx, rootCancel := context.WithCancel(context.Background())
@@ -86,6 +101,19 @@ func onReady() {
 		mu.Unlock()
 		go runTunnelLoop(ctx, cfg, mStatus, mToggle)
 	} else {
+		if os.IsNotExist(err) {
+			const tmpl = "listen_addr: \":8443\"\nauth_token: \"changeme\"\nname: \"my-pc\"\nlog_level: \"info\"\ninsecure: false\ntunnels: []\n"
+			if wErr := os.WriteFile(configPath, []byte(tmpl), 0644); wErr != nil {
+				log.Error("config.yaml 생성 실패", "err", wErr)
+				showError("Reversproxy", "config.yaml 생성 실패:\n"+wErr.Error())
+			} else {
+				log.Info("config.yaml 생성됨", "path", configPath)
+				openConfigFile(configPath)
+			}
+		} else {
+			log.Error("config.yaml 로드 실패", "err", err)
+			showError("Reversproxy", "설정 파일 오류:\n"+err.Error())
+		}
 		updateStatus(mStatus, mToggle, stateDisconnected)
 	}
 
@@ -168,6 +196,7 @@ func runTunnelLoop(
 	ln, err := tls.Listen("tcp", cfg.ListenAddr, tlsCfg)
 	if err != nil {
 		log.Error("failed to start TLS listener", "addr", cfg.ListenAddr, "err", err)
+		showError("Reversproxy 오류", "리스너 시작 실패 ("+cfg.ListenAddr+"):\n"+err.Error())
 		updateStatus(mStatus, mToggle, stateDisconnected)
 		return
 	}
