@@ -25,6 +25,7 @@ import (
 	"net/http"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -616,4 +617,99 @@ func doTLSEchoThrough(t *testing.T, proxyAddr string, clientTLS *tls.Config, msg
 		t.Fatalf("TLS read echo: %v", err)
 	}
 	return string(buf)
+}
+
+// ---------------------------------------------------------------------------
+// SC4: Source-identifying headers are stripped before forwarding
+// ---------------------------------------------------------------------------
+
+// TestSC4_SourceHeadersStripped verifies that headers which could reveal the
+// original client's identity (X-Forwarded-For, X-Real-IP, Forwarded, Via, etc.)
+// are removed before the HTTP request reaches the backend service.
+func TestSC4_SourceHeadersStripped(t *testing.T) {
+	infra := startHTTPInfra(t)
+	defer infra.shutdown()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var (
+		mu              sync.Mutex
+		capturedHeaders http.Header
+		gotRequest      = make(chan struct{}, 1)
+	)
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("SC4: listen: %v", err)
+	}
+	localPort := ln.Addr().(*net.TCPAddr).Port
+
+	srv := &http.Server{
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			capturedHeaders = r.Header.Clone()
+			mu.Unlock()
+			select {
+			case gotRequest <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+		}),
+	}
+	go func() {
+		defer ln.Close()
+		go func() {
+			<-ctx.Done()
+			_ = srv.Close()
+		}()
+		_ = srv.Serve(ln)
+	}()
+
+	ctrlConn, hresp := connectHTTPClient(t, infra, "sc4-test.local", "127.0.0.1", localPort)
+	defer ctrlConn.Close()
+
+	go runHTTPClientLoop(ctrlConn, map[string]string{hresp.TunnelID: hresp.ServerDataAddr})
+	time.Sleep(50 * time.Millisecond)
+
+	conn, err := net.DialTimeout("tcp", infra.httpAddr, 5*time.Second)
+	if err != nil {
+		t.Fatalf("SC4: dial HTTP proxy: %v", err)
+	}
+	defer conn.Close()
+
+	rawReq := "GET / HTTP/1.1\r\n" +
+		"Host: sc4-test.local\r\n" +
+		"X-Forwarded-For: 1.2.3.4\r\n" +
+		"X-Real-IP: 1.2.3.4\r\n" +
+		"Forwarded: for=1.2.3.4\r\n" +
+		"Via: 1.1 upstream-proxy\r\n" +
+		"X-Client-IP: 1.2.3.4\r\n" +
+		"Connection: close\r\n\r\n"
+	if _, err := conn.Write([]byte(rawReq)); err != nil {
+		t.Fatalf("SC4: write request: %v", err)
+	}
+
+	select {
+	case <-gotRequest:
+	case <-time.After(5 * time.Second):
+		t.Fatal("SC4: timeout waiting for backend to receive request")
+	}
+
+	mu.Lock()
+	headers := capturedHeaders
+	mu.Unlock()
+
+	sourceHdrs := []string{
+		"X-Forwarded-For",
+		"X-Real-Ip",
+		"Forwarded",
+		"Via",
+		"X-Client-Ip",
+	}
+	for _, h := range sourceHdrs {
+		if val := headers.Get(h); val != "" {
+			t.Errorf("SC4: header %q must be stripped, got %q", h, val)
+		}
+	}
 }

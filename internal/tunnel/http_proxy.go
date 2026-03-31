@@ -158,6 +158,11 @@ func handleHTTPConn(
 		"localAddr", fmt.Sprintf("%s:%d", entry.LocalHost, entry.LocalPort),
 	)
 
+	// Strip all source-identifying headers before forwarding.
+	// The proxy server is the sole communicating party — the backend service
+	// must have no knowledge of the original external client's identity or path.
+	stripSourceHeaders(req)
+
 	// Rebuild the raw HTTP request bytes from the parsed request so we can
 	// replay them into the data connection. We use a pipe: write the request
 	// back to a net.Conn-compatible buffer.
@@ -230,6 +235,32 @@ func relayHTTPConn(ctx context.Context, pending *pendingConn, connID string, raw
 	RelayBiDirectional(ctx, extConn, dataConn)
 
 	log.Info("HTTP proxy: relay finished", "connID", connID)
+}
+
+// sourceHeaders lists headers that could reveal the original client's
+// identity or network path. All are removed before forwarding through the tunnel.
+var sourceHeaders = []string{
+	"X-Forwarded-For",
+	"X-Real-Ip",
+	"X-Client-Ip",
+	"Client-Ip",
+	"Forwarded",
+	"Via",
+	"X-Forwarded-Host",
+	"X-Forwarded-Proto",
+	"X-Forwarded-Port",
+	"X-Originating-Ip",
+	"Cf-Connecting-Ip",
+	"True-Client-Ip",
+}
+
+// stripSourceHeaders removes all headers that could reveal the original
+// client's IP address or network path. After this call the backend service
+// has no knowledge of the external caller — only the proxy is visible.
+func stripSourceHeaders(req *http.Request) {
+	for _, h := range sourceHeaders {
+		req.Header.Del(h)
+	}
 }
 
 // writeHTTPError writes a minimal HTTP error response to conn.
