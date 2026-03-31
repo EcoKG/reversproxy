@@ -92,29 +92,30 @@ func onReady() {
 	cancelFn = rootCancel
 	mu.Unlock()
 
-	// Auto-connect on startup if config.yaml is loadable.
-	cfg, err := config.LoadClientConfig(configPath)
-	if err == nil {
-		ctx, cancel := context.WithCancel(rootCtx)
-		mu.Lock()
-		cancelFn = cancel
-		mu.Unlock()
-		go runTunnelLoop(ctx, cfg, mStatus, mToggle)
+	// Auto-connect on startup: check file existence first, then load.
+	if _, statErr := os.Stat(configPath); os.IsNotExist(statErr) {
+		const tmpl = "listen_addr: \":8443\"\nauth_token: \"changeme\"\nname: \"my-pc\"\nlog_level: \"info\"\ninsecure: false\ntunnels: []\n"
+		if wErr := os.WriteFile(configPath, []byte(tmpl), 0644); wErr != nil {
+			log.Error("config.yaml 생성 실패", "err", wErr)
+			showError("Reversproxy", "config.yaml 생성 실패:\n"+wErr.Error())
+		} else {
+			log.Info("config.yaml 생성됨", "path", configPath)
+			openConfigFile(configPath)
+		}
+		updateStatus(mStatus, mToggle, stateDisconnected)
 	} else {
-		if os.IsNotExist(err) {
-			const tmpl = "listen_addr: \":8443\"\nauth_token: \"changeme\"\nname: \"my-pc\"\nlog_level: \"info\"\ninsecure: false\ntunnels: []\n"
-			if wErr := os.WriteFile(configPath, []byte(tmpl), 0644); wErr != nil {
-				log.Error("config.yaml 생성 실패", "err", wErr)
-				showError("Reversproxy", "config.yaml 생성 실패:\n"+wErr.Error())
-			} else {
-				log.Info("config.yaml 생성됨", "path", configPath)
-				openConfigFile(configPath)
-			}
+		cfg, err := config.LoadClientConfig(configPath)
+		if err == nil {
+			ctx, cancel := context.WithCancel(rootCtx)
+			mu.Lock()
+			cancelFn = cancel
+			mu.Unlock()
+			go runTunnelLoop(ctx, cfg, mStatus, mToggle)
 		} else {
 			log.Error("config.yaml 로드 실패", "err", err)
 			showError("Reversproxy", "설정 파일 오류:\n"+err.Error())
+			updateStatus(mStatus, mToggle, stateDisconnected)
 		}
-		updateStatus(mStatus, mToggle, stateDisconnected)
 	}
 
 	// Menu event loop.
@@ -124,8 +125,14 @@ func onReady() {
 			state := connStateVal(currentState.Load())
 			if state == stateDisconnected {
 				// Start connecting.
+				if _, statErr := os.Stat(configPath); os.IsNotExist(statErr) {
+					showError("Reversproxy", "config.yaml 파일이 없습니다.\n트레이 메뉴 → 설정 파일 열기를 눌러 설정 후 다시 시도하세요.")
+					updateStatus(mStatus, mToggle, stateDisconnected)
+					continue
+				}
 				reloadedCfg, loadErr := config.LoadClientConfig(configPath)
 				if loadErr != nil {
+					showError("Reversproxy", "설정 파일 오류:\n"+loadErr.Error())
 					updateStatus(mStatus, mToggle, stateDisconnected)
 					continue
 				}
