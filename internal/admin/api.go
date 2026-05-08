@@ -11,8 +11,10 @@ package admin
 import (
 	"context"
 	"crypto/subtle"
+	"embed"
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -23,6 +25,9 @@ import (
 	"github.com/EcoKG/reversproxy/internal/stats"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
+
+//go:embed ui/index.html ui/app.js ui/style.css
+var uiFS embed.FS
 
 // -----------------------------------------------------------------------
 // Wire types
@@ -144,6 +149,14 @@ func (s *Server) StartWithListener(ctx context.Context, ln net.Listener) error {
 	mux.HandleFunc("/api/tunnels", s.authMiddleware(s.handleTunnels))
 	mux.HandleFunc("/api/stats", s.authMiddleware(s.handleStats))
 
+	// Dashboard UI (HTML/JS/CSS embedded at build time).
+	staticFS, err := fs.Sub(uiFS, "ui")
+	if err != nil {
+		return fmt.Errorf("admin: ui sub fs: %w", err)
+	}
+	mux.Handle("/static/", http.StripPrefix("/static/", http.FileServer(http.FS(staticFS))))
+	mux.HandleFunc("/", s.handleIndex)
+
 	s.httpSrv = &http.Server{
 		Handler:      mux,
 		ReadTimeout:  5 * time.Second,
@@ -171,6 +184,29 @@ func (s *Server) StartWithListener(ctx context.Context, ln net.Listener) error {
 // -----------------------------------------------------------------------
 // Handlers
 // -----------------------------------------------------------------------
+
+// handleIndex serves the dashboard at "/". Any other unknown path returns 404.
+// The dashboard polls the JSON API endpoints from the browser, so the HTML
+// itself does not need to be authenticated; the JSON endpoints still are
+// (when a token is configured).
+func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" && r.URL.Path != "/index.html" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	data, err := uiFS.ReadFile("ui/index.html")
+	if err != nil {
+		http.Error(w, "ui not embedded", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache")
+	_, _ = w.Write(data)
+}
 
 // handleClients responds with the list of connected clients.
 //

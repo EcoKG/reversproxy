@@ -5,8 +5,11 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"log/slog"
+	"net"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/EcoKG/reversproxy/internal/client"
 	"github.com/EcoKG/reversproxy/internal/config"
@@ -159,16 +162,18 @@ func main() {
 	}()
 
 	// ------------------------------------------------------------------ //
-	// Persistent SOCKS5 / HTTP CONNECT proxies
+	// Server pool — multi-server support.
 	//
-	// These are started ONCE and survive server reconnections. The
-	// sharedWriter's underlying connection is swapped on each reconnect.
+	// Each connected proxy server is held as an independent session in this
+	// pool with its own writer and SOCKS mux. Client-originated SOCKS5 /
+	// HTTP CONNECT / port-forward requests pick a session round-robin.
+	// External traffic that arrives on a server's public ports flows
+	// through that server's own session and never crosses the pool.
 	// ------------------------------------------------------------------ //
-	sharedWriter := &client.ConnWriter{}
-	clientMux := tunnel.NewSOCKSMux()
+	pool := client.NewServerPool()
 
 	if cfg.SOCKSAddr != "" {
-		if err := socks.StartClientSOCKSProxy(ctx, cfg.SOCKSAddr, sharedWriter, clientMux, log, cfg.SOCKSUser, cfg.SOCKSPass); err != nil {
+		if err := socks.StartClientSOCKSProxy(ctx, cfg.SOCKSAddr, pool, log, cfg.SOCKSUser, cfg.SOCKSPass); err != nil {
 			log.Error("failed to start client SOCKS5 proxy", "addr", cfg.SOCKSAddr, "err", err)
 		} else {
 			fmt.Printf("SOCKS5 proxy: socks5://127.0.0.1%s\n", socks.LastClientSOCKSAddr)
@@ -176,18 +181,15 @@ func main() {
 	}
 
 	if cfg.HTTPProxyAddr != "" {
-		if err := socks.StartHTTPConnectProxy(ctx, cfg.HTTPProxyAddr, sharedWriter, clientMux, log); err != nil {
+		if err := socks.StartHTTPConnectProxy(ctx, cfg.HTTPProxyAddr, pool, log); err != nil {
 			log.Error("failed to start HTTP CONNECT proxy", "addr", cfg.HTTPProxyAddr, "err", err)
 		} else {
 			fmt.Printf("HTTP CONNECT proxy: http://%s (use HTTPS_PROXY)\n", socks.LastClientHTTPProxyAddr)
 		}
 	}
 
-	// ------------------------------------------------------------------ //
-	// Port forwards (built-in socat replacement)
-	// ------------------------------------------------------------------ //
 	for _, pf := range cfg.PortForwards {
-		if err := socks.StartPortForward(ctx, pf.LocalPort, pf.RemoteHost, pf.RemotePort, pf.Bind, sharedWriter, clientMux, log); err != nil {
+		if err := socks.StartPortForward(ctx, pf.LocalPort, pf.RemoteHost, pf.RemotePort, pf.Bind, pool, log); err != nil {
 			log.Error("failed to start port forward", "localPort", pf.LocalPort, "err", err)
 		} else {
 			fmt.Printf("Port forward: localhost:%d → %s:%d\n", pf.LocalPort, pf.RemoteHost, pf.RemotePort)
@@ -195,7 +197,8 @@ func main() {
 	}
 
 	// ------------------------------------------------------------------ //
-	// Accept loop — handle each incoming server connection
+	// Accept loop — each incoming server connection is handled in its own
+	// goroutine so multiple servers can be served concurrently.
 	// ------------------------------------------------------------------ //
 	for {
 		conn, err := ln.Accept()
@@ -209,17 +212,36 @@ func main() {
 			return
 		}
 
-		log.Info("server connected", "remote", conn.RemoteAddr())
-
-		// Swap the writer to the new connection and clear stale mux channels.
-		sharedWriter.SwapConn(conn)
-		clientMux.CloseAll()
-
-		// Handle this connection (blocks until lost).
-		client.HandleServerConn(ctx, conn, cfg.AuthToken, cfg.Name, rcCfg, sharedWriter, clientMux, log)
-
-		// Connection lost — clear writer so SOCKS/HTTP return 502 instead of writing to dead conn.
-		sharedWriter.ClearConn()
-		log.Warn("server connection lost, waiting for reconnect")
+		go handleServerSession(ctx, conn, cfg.AuthToken, cfg.Name, rcCfg, pool, log)
 	}
+}
+
+// handleServerSession wraps one inbound server connection in a ServerSession,
+// adds it to the pool for the duration of the handshake + message loop, and
+// removes it on exit.
+func handleServerSession(
+	ctx context.Context,
+	conn net.Conn,
+	authToken, name string,
+	rcCfg *reconnect.ClientConfig,
+	pool *client.ServerPool,
+	log *slog.Logger,
+) {
+	session := &client.ServerSession{
+		ID:          conn.RemoteAddr().String(),
+		Conn:        conn,
+		Writer:      client.NewConnWriter(conn),
+		Mux:         tunnel.NewSOCKSMux(),
+		Addr:        conn.RemoteAddr().String(),
+		ConnectedAt: time.Now(),
+	}
+
+	pool.Add(session)
+	defer pool.Remove(session)
+
+	log.Info("server connected", "remote", session.Addr, "active_servers", pool.Len())
+
+	client.HandleServerConn(ctx, session, authToken, name, rcCfg, log)
+
+	log.Warn("server connection ended", "remote", session.Addr, "active_servers", pool.Len()-1)
 }

@@ -26,6 +26,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/EcoKG/reversproxy/internal/client"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
@@ -36,15 +37,12 @@ var LastClientHTTPProxyAddr string
 
 // StartHTTPConnectProxy starts a local HTTP CONNECT proxy listener on addr.
 //
-//   - cw  — thread-safe writer for the control connection to the server.
-//   - mux — the SOCKSMux that the client message loop uses to dispatch inbound
-//     MsgSOCKSData / MsgSOCKSClose / MsgSOCKSReady frames (shared with the
-//     SOCKS5 proxy if both are running).
+//   - pool — pool of active server sessions; each new request picks one
+//     round-robin. If empty, requests are rejected with 503.
 func StartHTTPConnectProxy(
 	ctx context.Context,
 	addr string,
-	cw ControlWriter,
-	mux *tunnel.SOCKSMux,
+	pool *client.ServerPool,
 	log *slog.Logger,
 ) error {
 	ln, err := net.Listen("tcp", addr)
@@ -73,7 +71,7 @@ func StartHTTPConnectProxy(
 				}
 				return
 			}
-			go handleHTTPConnectConn(ctx, conn, cw, mux, log)
+			go handleHTTPConnectConn(ctx, conn, pool, log)
 		}
 	}()
 
@@ -84,8 +82,7 @@ func StartHTTPConnectProxy(
 func handleHTTPConnectConn(
 	ctx context.Context,
 	conn net.Conn,
-	cw ControlWriter,
-	mux *tunnel.SOCKSMux,
+	pool *client.ServerPool,
 	log *slog.Logger,
 ) {
 	defer conn.Close()
@@ -162,9 +159,19 @@ func handleHTTPConnectConn(
 
 	_ = conn.SetDeadline(time.Time{})
 
+	session := pool.Pick()
+	if session == nil {
+		log.Warn("http connect proxy: no servers available, rejecting", "remote", conn.RemoteAddr())
+		writeHTTPError(conn, "503 Service Unavailable")
+		return
+	}
+	cw := session.Writer
+	mux := session.Mux
+
 	log.Info("http connect proxy: CONNECT request",
 		"target", target,
 		"remote", conn.RemoteAddr(),
+		"server", session.Addr,
 	)
 
 	// ------------------------------------------------------------------ //
