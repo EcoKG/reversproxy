@@ -24,6 +24,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/EcoKG/reversproxy/internal/client"
 	"github.com/EcoKG/reversproxy/internal/logger"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/socks"
@@ -86,9 +87,16 @@ func newHTTPProxyTestEnv(t *testing.T, ctx context.Context) (proxyAddr string, c
 		}
 	}()
 
-	// Start the HTTP CONNECT proxy using clientSide as the control writer.
+	// Start the HTTP CONNECT proxy with a single-session pool.
 	cw := &pipeControlWriter{conn: clientSide}
-	if err := socks.StartHTTPConnectProxy(ctx, "127.0.0.1:0", cw, clientMux, log); err != nil {
+	pool := client.NewServerPool()
+	pool.Add(&client.ServerSession{
+		Conn:   clientSide,
+		Writer: cw,
+		Mux:    clientMux,
+		Addr:   "test-pipe",
+	})
+	if err := socks.StartHTTPConnectProxy(ctx, "127.0.0.1:0", pool, log); err != nil {
 		serverSide.Close()
 		clientSide.Close()
 		t.Fatalf("StartHTTPConnectProxy: %v", err)

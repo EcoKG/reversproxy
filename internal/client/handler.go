@@ -8,8 +8,6 @@ import (
 	"encoding/gob"
 	"fmt"
 	"log/slog"
-	"net"
-	"sync"
 	"time"
 
 	"github.com/EcoKG/reversproxy/internal/protocol"
@@ -17,65 +15,34 @@ import (
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
 
-// ConnWriter wraps a net.Conn with a mutex so that all writes from concurrent
-// goroutines (SOCKS relay goroutines + message loop) are serialised.
-// It implements socks.ControlWriter.
-// The underlying connection can be swapped via SwapConn when the server reconnects.
-type ConnWriter struct {
-	mu   sync.Mutex
-	conn net.Conn
-}
-
-// WriteMsg writes a protocol message to the current connection.
-// Returns an error if no connection is active.
-func (w *ConnWriter) WriteMsg(msgType protocol.MsgType, payload any) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if w.conn == nil {
-		return fmt.Errorf("no active control connection")
-	}
-	return protocol.WriteMessage(w.conn, msgType, payload)
-}
-
-// SwapConn replaces the underlying connection (called on server reconnect).
-func (w *ConnWriter) SwapConn(c net.Conn) {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.conn = c
-}
-
-// ClearConn sets the connection to nil (called when connection is lost).
-func (w *ConnWriter) ClearConn() {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	w.conn = nil
-}
-
-// HandleServerConn manages a single connection from the proxy server.
+// HandleServerConn manages a single connection from a proxy server.
 // It:
 //  1. Performs the reversed registration handshake.
-//  2. Re-registers all configured tunnels.
+//  2. Re-registers all configured tunnels on this server.
 //  3. Runs the message loop until the connection is lost or ctx is cancelled.
 //
-// The SOCKS5/HTTP CONNECT proxies are started once by the caller and share the
-// swappable sharedWriter and clientMux passed here.
+// Each session has its own writer and mux so multiple servers can be served
+// concurrently. Client-originated SOCKS / HTTP CONNECT / port-forward traffic
+// is routed via ServerPool.Pick which selects one session round-robin.
 func HandleServerConn(
 	ctx context.Context,
-	conn net.Conn,
+	session *ServerSession,
 	authToken, name string,
 	cfg *reconnect.ClientConfig,
-	sharedWriter *ConnWriter,
-	clientMux *tunnel.SOCKSMux,
 	log *slog.Logger,
 ) {
+	conn := session.Conn
+	writer := session.Writer
+	mux := session.Mux
+
 	defer conn.Close()
+	defer mux.CloseAll()
 
 	// ------------------------------------------------------------------ //
 	// Registration handshake (reversed)
 	// Server sends ClientRegister → client validates → client sends RegisterResp
 	// ------------------------------------------------------------------ //
 
-	// Give the handshake 10 seconds to complete.
 	if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
 		log.Error("failed to set registration deadline", "err", err)
 		return
@@ -111,29 +78,36 @@ func HandleServerConn(
 		return
 	}
 
-	// Send RegisterResp with the client's name in ServerID so the server knows
-	// which client it has connected to.
 	if err := protocol.WriteMessage(conn, protocol.MsgRegisterResp, protocol.RegisterResp{
 		Status:   "ok",
-		ServerID: name, // client's name carried in ServerID field
+		ServerID: name,
 	}); err != nil {
 		log.Error("failed to send RegisterResp", "err", err)
 		return
 	}
 
-	log.Info("registered with server", "remote", conn.RemoteAddr(), "client_name", name)
+	// Capture server-supplied identity (carried in ClientRegister.Name field
+	// per the reversed handshake) so the GUI/admin can show it.
+	if msg.Name != "" {
+		session.ServerName = msg.Name
+	}
 
-	// Remove the registration deadline.
+	log.Info("registered with server",
+		"remote", conn.RemoteAddr(),
+		"client_name", name,
+		"server_name", msg.Name,
+	)
+
 	if err := conn.SetDeadline(time.Time{}); err != nil {
 		log.Error("failed to clear deadline", "err", err)
 		return
 	}
 
 	// ------------------------------------------------------------------ //
-	// Re-register all tunnels
+	// Re-register all tunnels with this server.
 	// ------------------------------------------------------------------ //
 	tunnelDataAddrs := make(map[string]string)
-	var serverDataAddr string // first data addr learned from any tunnel registration
+	var serverDataAddr string
 
 	for _, tc := range cfg.Tunnels {
 		req := protocol.RequestTunnel{
@@ -176,10 +150,10 @@ func HandleServerConn(
 			"publicPort", tresp.PublicPort,
 			"serverDataAddr", tresp.ServerDataAddr,
 		)
-		fmt.Printf("Tunnel: 0.0.0.0:%d → %s:%d\n", tresp.PublicPort, tc.LocalHost, tc.LocalPort)
+		fmt.Printf("Tunnel: 0.0.0.0:%d → %s:%d (server=%s)\n",
+			tresp.PublicPort, tc.LocalHost, tc.LocalPort, session.Addr)
 	}
 
-	// Register HTTP tunnels.
 	for _, hc := range cfg.HTTPTunnels {
 		req := protocol.RequestHTTPTunnel{
 			Hostname:  hc.Hostname,
@@ -221,10 +195,10 @@ func HandleServerConn(
 			"tunnelID", hresp.TunnelID,
 			"serverDataAddr", hresp.ServerDataAddr,
 		)
-		fmt.Printf("HTTP Tunnel: http://%s → %s:%d\n", hresp.Hostname, hc.LocalHost, hc.LocalPort)
+		fmt.Printf("HTTP Tunnel: http://%s → %s:%d (server=%s)\n",
+			hresp.Hostname, hc.LocalHost, hc.LocalPort, session.Addr)
 	}
 
-	// Register HTTPS tunnels.
 	for _, hc := range cfg.HTTPSTunnels {
 		req := protocol.RequestHTTPSTunnel{
 			Hostname:  hc.Hostname,
@@ -266,11 +240,13 @@ func HandleServerConn(
 			"tunnelID", hresp.TunnelID,
 			"serverDataAddr", hresp.ServerDataAddr,
 		)
-		fmt.Printf("HTTPS Tunnel: https://%s → %s:%d\n", hresp.Hostname, hc.LocalHost, hc.LocalPort)
+		fmt.Printf("HTTPS Tunnel: https://%s → %s:%d (server=%s)\n",
+			hresp.Hostname, hc.LocalHost, hc.LocalPort, session.Addr)
 	}
 
 	// ------------------------------------------------------------------ //
-	// Graceful shutdown for this connection
+	// Per-session shutdown signal: if the parent ctx is cancelled, send a
+	// disconnect frame and force the read loop to unblock.
 	// ------------------------------------------------------------------ //
 	connCtx, connCancel := context.WithCancel(ctx)
 	defer connCancel()
@@ -278,9 +254,8 @@ func HandleServerConn(
 	go func() {
 		<-connCtx.Done()
 		if ctx.Err() != nil {
-			// Global shutdown — send disconnect
-			log.Info("signal received, sending disconnect")
-			_ = sharedWriter.WriteMsg(protocol.MsgDisconnect, protocol.Disconnect{Reason: "client shutdown"})
+			log.Info("signal received, sending disconnect", "server", session.Addr)
+			_ = writer.WriteMsg(protocol.MsgDisconnect, protocol.Disconnect{Reason: "client shutdown"})
 		}
 		_ = conn.SetDeadline(time.Now().Add(2 * time.Second))
 	}()
@@ -300,7 +275,7 @@ func HandleServerConn(
 			if ctx.Err() != nil {
 				return
 			}
-			log.Warn("connection to server lost", "err", err)
+			log.Warn("connection to server lost", "server", session.Addr, "err", err)
 			return
 		}
 
@@ -311,7 +286,7 @@ func HandleServerConn(
 				log.Warn("failed to decode Ping", "err", err)
 				continue
 			}
-			if err := sharedWriter.WriteMsg(protocol.MsgPong, protocol.Pong{Seq: ping.Seq}); err != nil {
+			if err := writer.WriteMsg(protocol.MsgPong, protocol.Pong{Seq: ping.Seq}); err != nil {
 				if ctx.Err() != nil {
 					return
 				}
@@ -325,9 +300,9 @@ func HandleServerConn(
 			if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&disc); err != nil {
 				log.Warn("failed to decode Disconnect from server", "err", err)
 			} else {
-				log.Info("server requested disconnect", "reason", disc.Reason)
+				log.Info("server requested disconnect", "reason", disc.Reason, "server", session.Addr)
 			}
-			_ = sharedWriter.WriteMsg(protocol.MsgDisconnectAck, protocol.DisconnectAck{})
+			_ = writer.WriteMsg(protocol.MsgDisconnectAck, protocol.DisconnectAck{})
 			return
 
 		case protocol.MsgOpenConnection:
@@ -346,16 +321,13 @@ func HandleServerConn(
 			}
 			tunnel.HandleOpenConnection(openConn, dataAddr, log)
 
-		// ---- Reversed SOCKS5 messages (Phase 4 reversed) ----
-		// The server sends these back to us after we sent MsgSOCKSConnect.
-
 		case protocol.MsgSOCKSReady:
 			var ready protocol.SOCKSReady
 			if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&ready); err != nil {
 				log.Warn("failed to decode SOCKSReady", "err", err)
 				continue
 			}
-			if err := clientMux.DeliverReady(ready.ConnID, ready.Success, ready.Error); err != nil {
+			if err := mux.DeliverReady(ready.ConnID, ready.Success, ready.Error); err != nil {
 				log.Debug("SOCKSReady deliver failed", "connID", ready.ConnID, "err", err)
 			}
 
@@ -365,7 +337,7 @@ func HandleServerConn(
 				log.Warn("failed to decode SOCKSData", "err", err)
 				continue
 			}
-			if err := clientMux.Deliver(sd.ConnID, sd.Payload); err != nil {
+			if err := mux.Deliver(sd.ConnID, sd.Payload); err != nil {
 				log.Debug("SOCKSData deliver failed", "connID", sd.ConnID, "err", err)
 			}
 
@@ -375,7 +347,7 @@ func HandleServerConn(
 				log.Warn("failed to decode SOCKSClose", "err", err)
 				continue
 			}
-			clientMux.DeliverClose(sc.ConnID)
+			mux.DeliverClose(sc.ConnID)
 
 		default:
 			log.Warn("unhandled message type", "type", env.Type)

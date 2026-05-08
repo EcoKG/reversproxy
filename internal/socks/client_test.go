@@ -27,6 +27,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/EcoKG/reversproxy/internal/client"
 	"github.com/EcoKG/reversproxy/internal/logger"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/socks"
@@ -115,9 +116,16 @@ func newClientTestEnv(
 		}
 	}()
 
-	// Start the client-side SOCKS5 proxy.
+	// Start the client-side SOCKS5 proxy with a single-session pool.
 	cw := &pipeControlWriter{conn: clientSide}
-	if err := socks.StartClientSOCKSProxy(ctx, "127.0.0.1:0", cw, clientMux, log, authUser, authPass); err != nil {
+	pool := client.NewServerPool()
+	pool.Add(&client.ServerSession{
+		Conn:   clientSide,
+		Writer: cw,
+		Mux:    clientMux,
+		Addr:   "test-pipe",
+	})
+	if err := socks.StartClientSOCKSProxy(ctx, "127.0.0.1:0", pool, log, authUser, authPass); err != nil {
 		t.Fatalf("StartClientSOCKSProxy: %v", err)
 	}
 

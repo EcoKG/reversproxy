@@ -16,20 +16,21 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/EcoKG/reversproxy/internal/client"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
 
 // StartPortForward listens on bindAddr:localPort and forwards each connection
-// to remoteHost:remotePort through the tunnel mux.
+// to remoteHost:remotePort through one of the active server sessions in pool.
+// A round-robin session is picked per accepted connection.
 func StartPortForward(
 	ctx context.Context,
 	localPort int,
 	remoteHost string,
 	remotePort int,
 	bindAddr string,
-	cw ControlWriter,
-	mux *tunnel.SOCKSMux,
+	pool *client.ServerPool,
 	log *slog.Logger,
 ) error {
 	if bindAddr == "" {
@@ -64,7 +65,7 @@ func StartPortForward(
 				}
 				return
 			}
-			go handlePortForward(ctx, conn, remoteHost, remotePort, cw, mux, log)
+			go handlePortForward(ctx, conn, remoteHost, remotePort, pool, log)
 		}
 	}()
 
@@ -76,16 +77,25 @@ func handlePortForward(
 	conn net.Conn,
 	remoteHost string,
 	remotePort int,
-	cw ControlWriter,
-	mux *tunnel.SOCKSMux,
+	pool *client.ServerPool,
 	log *slog.Logger,
 ) {
 	defer conn.Close()
 
+	session := pool.Pick()
+	if session == nil {
+		log.Warn("port forward: no servers available, rejecting", "remote", conn.RemoteAddr())
+		return
+	}
+	cw := session.Writer
+	mux := session.Mux
+
 	connID := uuid.New().String()
 	target := fmt.Sprintf("%s:%d", remoteHost, remotePort)
 
-	log.Info("port forward: new connection", "connID", connID, "target", target, "from", conn.RemoteAddr())
+	log.Info("port forward: new connection",
+		"connID", connID, "target", target,
+		"from", conn.RemoteAddr(), "server", session.Addr)
 
 	// Allocate mux channel before sending message
 	ch, err := mux.NewChannel(connID)

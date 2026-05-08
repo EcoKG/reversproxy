@@ -24,10 +24,22 @@ import (
 
 	"log/slog"
 
+	"github.com/EcoKG/reversproxy/internal/client"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/socks"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
+
+// poolWith returns a single-session ServerPool that wraps cw and mux for tests.
+func poolWith(cw client.ControlWriter, mux *tunnel.SOCKSMux) *client.ServerPool {
+	p := client.NewServerPool()
+	p.Add(&client.ServerSession{
+		Writer: cw,
+		Mux:    mux,
+		Addr:   "test",
+	})
+	return p
+}
 
 // ---------------------------------------------------------------------------
 // Helpers shared with client_test.go (same package socks_test)
@@ -104,7 +116,7 @@ func TestStartPortForward_ConnectAndForward(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close() // release so StartPortForward can bind
 
-	err = socks.StartPortForward(ctx, port, "example.com", 80, "127.0.0.1", cw, mux, log)
+	err = socks.StartPortForward(ctx, port, "example.com", 80, "127.0.0.1", poolWith(cw, mux), log)
 	if err != nil {
 		t.Fatalf("StartPortForward: %v", err)
 	}
@@ -184,7 +196,7 @@ func TestStartPortForward_InvalidTarget(t *testing.T) {
 	cw := &capturingControlWriter{}
 	log := discardLogger()
 
-	err = socks.StartPortForward(ctx, port, "example.com", 80, "127.0.0.1", cw, mux, log)
+	err = socks.StartPortForward(ctx, port, "example.com", 80, "127.0.0.1", poolWith(cw, mux), log)
 	if err == nil {
 		t.Error("expected error binding already-in-use port, got nil")
 	}
@@ -214,7 +226,7 @@ func TestHandlePortForward_RelayData(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 
-	if err := socks.StartPortForward(ctx, port, "127.0.0.1", 9999, "127.0.0.1", cw, mux, log); err != nil {
+	if err := socks.StartPortForward(ctx, port, "127.0.0.1", 9999, "127.0.0.1", poolWith(cw, mux), log); err != nil {
 		t.Fatalf("StartPortForward: %v", err)
 	}
 
@@ -284,7 +296,7 @@ func TestHandlePortForward_TargetClose(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 
-	if err := socks.StartPortForward(ctx, port, "unreachable.local", 1234, "127.0.0.1", cw, mux, log); err != nil {
+	if err := socks.StartPortForward(ctx, port, "unreachable.local", 1234, "127.0.0.1", poolWith(cw, mux), log); err != nil {
 		t.Fatalf("StartPortForward: %v", err)
 	}
 
@@ -343,7 +355,7 @@ func TestHandlePortForward_ClientClose(t *testing.T) {
 	port := ln.Addr().(*net.TCPAddr).Port
 	ln.Close()
 
-	if err := socks.StartPortForward(ctx, port, "example.com", 443, "127.0.0.1", cw, mux, log); err != nil {
+	if err := socks.StartPortForward(ctx, port, "example.com", 443, "127.0.0.1", poolWith(cw, mux), log); err != nil {
 		t.Fatalf("StartPortForward: %v", err)
 	}
 

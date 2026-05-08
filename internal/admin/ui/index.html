@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>reversproxy — server dashboard</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header>
+    <h1>reversproxy <span class="tag">server</span></h1>
+    <div class="meta">
+      <span id="status-dot" class="dot"></span>
+      <span id="status-text">connecting…</span>
+      <span class="sep">·</span>
+      <span id="last-update">—</span>
+    </div>
+  </header>
+
+  <main>
+    <section class="card" id="pending-card" hidden>
+      <h2>승인 대기 <span class="badge warn" id="pending-count">0</span></h2>
+      <table id="pending-table">
+        <thead><tr><th>이름</th><th>주소</th><th>지문 (SHA-256)</th><th>요청 시각</th><th></th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>요약</h2>
+      <div class="stats">
+        <div class="stat"><label>전체 연결</label><strong id="s-total">—</strong></div>
+        <div class="stat"><label>활성 연결</label><strong id="s-active">—</strong></div>
+        <div class="stat"><label>수신 바이트</label><strong id="s-in">—</strong></div>
+        <div class="stat"><label>송신 바이트</label><strong id="s-out">—</strong></div>
+        <div class="stat"><label>연결된 클라이언트</label><strong id="s-clients">—</strong></div>
+        <div class="stat"><label>활성 터널</label><strong id="s-tunnels">—</strong></div>
+      </div>
+    </section>
+
+    <section class="card">
+      <h2>클라이언트</h2>
+      <table id="clients-table">
+        <thead><tr><th>이름</th><th>주소</th><th>연결 시각</th><th>업타임</th><th></th></tr></thead>
+        <tbody><tr><td colspan="5" class="empty">연결된 클라이언트가 없습니다.</td></tr></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>터널</h2>
+      <table id="tunnels-table">
+        <thead><tr><th>유형</th><th>호스트/공개포트</th><th>로컬</th><th>클라이언트</th></tr></thead>
+        <tbody><tr><td colspan="4" class="empty">활성 터널이 없습니다.</td></tr></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>승인된 호스트 (known_hosts)</h2>
+      <table id="known-table">
+        <thead><tr><th>이름</th><th>지문</th><th></th></tr></thead>
+        <tbody><tr><td colspan="3" class="empty">등록된 호스트가 없습니다.</td></tr></tbody>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>이벤트 <span id="evt-status" class="badge">disconnected</span></h2>
+      <ul id="events-list" class="events">
+        <li class="empty">실시간 이벤트가 여기 표시됩니다.</li>
+      </ul>
+    </section>
+
+    <section class="card">
+      <h2>터널별 트래픽</h2>
+      <table id="tunnel-stats-table">
+        <thead><tr><th>터널 ID</th><th>연결수</th><th>수신</th><th>송신</th></tr></thead>
+        <tbody><tr><td colspan="4" class="empty">트래픽 통계 없음.</td></tr></tbody>
+      </table>
+    </section>
+  </main>
+
+  <footer>
+    <span>polling every <span id="interval">2</span>s</span>
+    <span class="sep">·</span>
+    <a href="/api/clients">/api/clients</a>
+    <a href="/api/tunnels">/api/tunnels</a>
+    <a href="/api/stats">/api/stats</a>
+    <a href="/api/pending">/api/pending</a>
+    <a href="/api/known-hosts">/api/known-hosts</a>
+    <a href="/api/events">/api/events</a>
+  </footer>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

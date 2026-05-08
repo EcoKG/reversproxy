@@ -25,6 +25,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/EcoKG/reversproxy/internal/client"
 	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
@@ -49,15 +50,14 @@ func (a ctrlWriterAdapter) Write(msgType protocol.MsgType, payload any) error {
 
 // StartClientSOCKSProxy starts the CLIENT-side SOCKS5 listener on addr.
 //
-//   - cw       — thread-safe writer for the control connection to the server.
-//   - mux      — the SOCKSMux that the client message loop uses to dispatch
-//     inbound MsgSOCKSData/MsgSOCKSClose/MsgSOCKSReady frames.
+//   - pool     — pool of active server sessions; each new request picks one
+//     round-robin. If the pool is empty when a request arrives the connection
+//     is rejected with a SOCKS general-failure reply.
 //   - authUser / authPass — enable RFC 1929 auth when both are non-empty.
 func StartClientSOCKSProxy(
 	ctx context.Context,
 	addr string,
-	cw ControlWriter,
-	mux *tunnel.SOCKSMux,
+	pool *client.ServerPool,
 	log *slog.Logger,
 	authUser, authPass string,
 ) error {
@@ -87,7 +87,7 @@ func StartClientSOCKSProxy(
 				}
 				return
 			}
-			go handleClientSOCKSConn(ctx, conn, cw, mux, log, authUser, authPass)
+			go handleClientSOCKSConn(ctx, conn, pool, log, authUser, authPass)
 		}
 	}()
 
@@ -98,8 +98,7 @@ func StartClientSOCKSProxy(
 func handleClientSOCKSConn(
 	ctx context.Context,
 	conn net.Conn,
-	cw ControlWriter,
-	mux *tunnel.SOCKSMux,
+	pool *client.ServerPool,
 	log *slog.Logger,
 	authUser, authPass string,
 ) {
@@ -115,9 +114,19 @@ func handleClientSOCKSConn(
 
 	_ = conn.SetDeadline(time.Time{})
 
+	session := pool.Pick()
+	if session == nil {
+		log.Warn("socks5 client: no servers available, rejecting", "remote", conn.RemoteAddr())
+		sendSOCKSReply(conn, repGeneralFailure, nil, 0)
+		return
+	}
+	cw := session.Writer
+	mux := session.Mux
+
 	log.Info("socks5 client: CONNECT request",
 		"target", fmt.Sprintf("%s:%d", targetHost, targetPort),
 		"remote", conn.RemoteAddr(),
+		"server", session.Addr,
 	)
 
 	// ------------------------------------------------------------------ //

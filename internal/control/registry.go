@@ -96,3 +96,27 @@ func (r *ClientRegistry) List() []*Client {
 	r.mu.RUnlock()
 	return out
 }
+
+// DisconnectByName invokes the cancel function and closes the underlying conn
+// for every client matching name. Returns the number of clients disconnected.
+// The dial loop will then re-dial automatically per its existing reconnect logic.
+func (r *ClientRegistry) DisconnectByName(name string) int {
+	r.mu.RLock()
+	matches := make([]*Client, 0)
+	for _, c := range r.clients {
+		if c.Name == name {
+			matches = append(matches, c)
+		}
+	}
+	r.mu.RUnlock()
+
+	for _, c := range matches {
+		if c.cancelFn != nil {
+			c.cancelFn()
+		}
+		if c.Conn != nil {
+			_ = c.Conn.Close()
+		}
+	}
+	return len(matches)
+}
