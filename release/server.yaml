@@ -1,0 +1,20 @@
+# reversproxy server — loopback test config
+data_addr:  "127.0.0.1:8444"
+http_addr:  "127.0.0.1:18080"
+https_addr: ""
+admin_addr: "127.0.0.1:9090"
+auth_token: "loopback-test-token"
+admin_token: ""
+log_level: "info"
+
+# 자체 서명 cert 검증을 건너뜀 (loopback 테스트용).
+insecure: true
+
+# Phase 3 TOFU: 첫 연결 자동 승인 (테스트 편의).
+auto_approve: true
+known_hosts_path: "known_hosts.yaml"
+
+clients:
+  - name: "loopback-client"
+    address: "127.0.0.1:8443"
+    auth_token: "loopback-test-token"

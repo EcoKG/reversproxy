@@ -1,0 +1,19 @@
+# reversproxy client — loopback test config
+listen_addr: "127.0.0.1:8443"
+auth_token: "loopback-test-token"
+name: "loopback-client"
+insecure: true
+log_level: "info"
+
+# 클라이언트 PC에서 :3000을 띄워두고 (run-loopback.ps1이 알아서 띄움),
+# 서버 :19000으로 들어온 외부 트래픽이 그곳으로 흐름.
+tunnels:
+  - type: tcp
+    local_host: "127.0.0.1"
+    local_port: 3000
+    requested_port: 19000
+
+  - type: http
+    hostname: "test.local"
+    local_host: "127.0.0.1"
+    local_port: 3000
