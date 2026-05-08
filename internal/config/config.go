@@ -67,22 +67,29 @@ type ServerConfig struct {
 	// Clients is the list of client addresses the server will dial.
 	// Each entry must have at minimum an Address field.
 	Clients []ClientTarget `yaml:"clients"`
+	// KnownHostsPath is the path to the YAML file storing approved client TLS
+	// fingerprints (TOFU). Empty = "known_hosts.yaml" alongside the binary.
+	KnownHostsPath string `yaml:"known_hosts_path"`
+	// AutoApprove disables the TOFU prompt and trusts every connecting client
+	// (only safe for closed dev networks).
+	AutoApprove bool `yaml:"auto_approve"`
 }
 
 // DefaultServerConfig returns a ServerConfig populated with production-ready
 // defaults.
 func DefaultServerConfig() *ServerConfig {
 	return &ServerConfig{
-		DataAddr:  ":8444",
-		HTTPAddr:  ":8080",
-		HTTPSAddr: ":8445",
-		AdminAddr: ":9090",
-		AuthToken: "changeme",
-		CertPath:  "server.crt",
-		KeyPath:   "server.key",
-		Insecure:  true,
-		MinPort:   1,
-		LogLevel:  "info",
+		DataAddr:       ":8444",
+		HTTPAddr:       ":8080",
+		HTTPSAddr:      ":8445",
+		AdminAddr:      ":9090",
+		AuthToken:      "changeme",
+		CertPath:       "server.crt",
+		KeyPath:        "server.key",
+		Insecure:       true,
+		MinPort:        1,
+		LogLevel:       "info",
+		KnownHostsPath: "known_hosts.yaml",
 	}
 }
 

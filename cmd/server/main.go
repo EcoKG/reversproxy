@@ -117,6 +117,14 @@ func main() {
 	ctrlConns := tunnel.NewControlConnRegistry()
 	statsReg  := stats.NewRegistry()
 	globalStats := stats.Global
+	events    := admin.NewEventBus(64)
+
+	knownHosts, err := control.LoadKnownHosts(cfg.KnownHostsPath)
+	if err != nil {
+		log.Error("failed to load known_hosts", "path", cfg.KnownHostsPath, "err", err)
+		os.Exit(1)
+	}
+	approver := control.NewApprover()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -157,6 +165,8 @@ func main() {
 	// Start the admin API server.
 	if cfg.AdminAddr != "" {
 		adminSrv := admin.New(reg, mgr, statsReg, globalStats, log, cfg.AdminToken)
+		adminSrv.WithApproval(approver, knownHosts)
+		adminSrv.WithEvents(events)
 		if err := adminSrv.Start(ctx, cfg.AdminAddr); err != nil {
 			log.Error("failed to start admin server", "addr", cfg.AdminAddr, "err", err)
 			os.Exit(1)
@@ -206,7 +216,7 @@ func main() {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			dialClientLoop(ctx, target, effectiveToken, reg, mgr, resolvedDataAddr, ctrlConns, log, globalStats, clientTLSCfg)
+			dialClientLoop(ctx, target, effectiveToken, reg, mgr, resolvedDataAddr, ctrlConns, log, globalStats, clientTLSCfg, knownHosts, approver, events, cfg.AutoApprove)
 		}()
 	}
 
@@ -254,6 +264,10 @@ func dialClientLoop(
 	log *slog.Logger,
 	globalStats *stats.ServerStats,
 	tlsCfg *tls.Config,
+	knownHosts *control.KnownHosts,
+	approver *control.Approver,
+	events *admin.EventBus,
+	autoApprove bool,
 ) {
 
 	backoff := reconnect.NewBackoff()
@@ -289,7 +303,32 @@ func dialClientLoop(
 		}
 
 		conn := rawConn.(net.Conn)
+
+		// ------------------------------------------------------------------ //
+		// TOFU gate — capture the client's TLS leaf cert fingerprint and
+		// either auto-trust (known + match), reject (known + mismatch), or
+		// block awaiting operator approval.
+		// ------------------------------------------------------------------ //
+		ok, err := tofuCheck(ctx, conn, target.Name, target.Address, knownHosts, approver, events, autoApprove, log)
+		if err != nil || !ok {
+			_ = conn.Close()
+			if ctx.Err() != nil {
+				return
+			}
+			delay := backoff.Next()
+			log.Warn("client rejected by TOFU gate, retrying",
+				"name", target.Name, "addr", target.Address,
+				"err", err, "backoff", delay.String())
+			select {
+			case <-time.After(delay):
+			case <-ctx.Done():
+				return
+			}
+			continue
+		}
+
 		log.Info("connected to client", "name", target.Name, "addr", target.Address)
+		events.Publish(admin.Event{Type: "client.connected", Name: target.Name, Addr: target.Address})
 
 		globalStats.TotalConnections.Add(1)
 		globalStats.ActiveConnections.Add(1)
@@ -298,6 +337,7 @@ func dialClientLoop(
 		control.HandleControlConn(ctx, conn, reg, token, log, mgr, dataAddr, ctrlConns)
 
 		globalStats.ActiveConnections.Add(-1)
+		events.Publish(admin.Event{Type: "client.disconnected", Name: target.Name, Addr: target.Address})
 
 		if ctx.Err() != nil {
 			return
@@ -318,6 +358,78 @@ func dialClientLoop(
 		// Reset backoff when we successfully reconnect (on next successful HandleControlConn).
 		backoff.Reset()
 	}
+}
+
+// tofuCheck inspects the TLS peer certificate on conn and decides whether to
+// proceed. Returns (true, nil) on accept; (false, nil) on rejection (caller
+// should close conn and retry); (false, err) on infrastructure errors.
+func tofuCheck(
+	ctx context.Context,
+	conn net.Conn,
+	name, addr string,
+	known *control.KnownHosts,
+	approver *control.Approver,
+	events *admin.EventBus,
+	autoApprove bool,
+	log *slog.Logger,
+) (bool, error) {
+	tlsConn, ok := conn.(*tls.Conn)
+	if !ok {
+		// Not a TLS connection — we can't enforce TOFU. Allow with a warning so
+		// dev setups using net.Pipe etc. keep working.
+		log.Warn("non-TLS conn in TOFU gate, skipping", "name", name)
+		return true, nil
+	}
+	state := tlsConn.ConnectionState()
+	if len(state.PeerCertificates) == 0 {
+		return false, fmt.Errorf("no peer certificates")
+	}
+	fp := control.Fingerprint(state.PeerCertificates[0])
+
+	if existing, ok := known.Lookup(name); ok {
+		if existing == fp {
+			log.Debug("TOFU: known fingerprint match", "name", name, "fp", control.ShortFingerprint(fp))
+			return true, nil
+		}
+		log.Error("SECURITY: TOFU fingerprint mismatch — possible MITM",
+			"name", name, "addr", addr,
+			"expected", control.ShortFingerprint(existing),
+			"got", control.ShortFingerprint(fp))
+		events.Publish(admin.Event{
+			Type: "client.fingerprint_mismatch", Name: name, Addr: addr,
+			Detail: "expected=" + control.ShortFingerprint(existing) + " got=" + control.ShortFingerprint(fp),
+		})
+		return false, nil
+	}
+
+	if autoApprove {
+		log.Warn("TOFU auto-approve: trusting unknown client",
+			"name", name, "fp", control.ShortFingerprint(fp))
+		if err := known.Add(name, fp); err != nil {
+			return false, fmt.Errorf("known_hosts add: %w", err)
+		}
+		return true, nil
+	}
+
+	log.Info("TOFU: awaiting operator approval",
+		"name", name, "addr", addr, "fp", control.ShortFingerprint(fp))
+	events.Publish(admin.Event{
+		Type: "client.pending", Name: name, Addr: addr,
+		Detail: "fingerprint=" + control.ShortFingerprint(fp),
+	})
+
+	decision := approver.Submit(ctx, name, addr, fp)
+	if decision == control.DecisionApproved {
+		if err := known.Add(name, fp); err != nil {
+			return false, fmt.Errorf("known_hosts add: %w", err)
+		}
+		events.Publish(admin.Event{Type: "client.approved", Name: name, Addr: addr})
+		log.Info("TOFU: operator approved", "name", name)
+		return true, nil
+	}
+	events.Publish(admin.Event{Type: "client.rejected", Name: name, Addr: addr})
+	log.Warn("TOFU: operator rejected", "name", name)
+	return false, nil
 }
 
 // buildClientTLSConfig builds a *tls.Config for the server's outbound
