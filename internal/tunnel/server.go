@@ -110,7 +110,7 @@ func handleDataConn(conn net.Conn, mgr *Manager, log *slog.Logger) {
 func StartPublicListener(
 	ctx context.Context,
 	entry *TunnelEntry,
-	clientConn net.Conn,
+	cw *CtrlConnWriter,
 	mgr *Manager,
 	log *slog.Logger,
 ) {
@@ -150,7 +150,7 @@ func StartPublicListener(
 			LocalHost: entry.LocalHost,
 			LocalPort: entry.LocalPort,
 		}
-		if err := protocol.WriteMessage(clientConn, protocol.MsgOpenConnection, openMsg); err != nil {
+		if err := cw.Write(protocol.MsgOpenConnection, openMsg); err != nil {
 			log.Warn("failed to send OpenConnection to client", "connID", connID, "err", err)
 			extConn.Close()
 			continue

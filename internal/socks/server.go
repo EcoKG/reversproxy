@@ -164,7 +164,7 @@ func handleSOCKSConn(
 		TargetHost: targetHost,
 		TargetPort: targetPort,
 	}
-	if err := protocol.WriteMessage(clientConn, protocol.MsgSOCKSConnect, msg); err != nil {
+	if err := clientConn.Write(protocol.MsgSOCKSConnect, msg); err != nil {
 		log.Warn("socks5: failed to send SOCKSConnect to client", "connID", connID, "err", err)
 		sendSOCKSReply(conn, repGeneralFailure, nil, 0)
 		return

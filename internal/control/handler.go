@@ -9,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"net"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -17,19 +16,6 @@ import (
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
-
-// serverCtrlWriter serialises writes to the control connection from multiple
-// concurrent SOCKS relay goroutines.
-type serverCtrlWriter struct {
-	mu   sync.Mutex
-	conn net.Conn
-}
-
-func (w *serverCtrlWriter) Write(msgType protocol.MsgType, payload any) error {
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	return protocol.WriteMessage(w.conn, msgType, payload)
-}
 
 // HandleControlConn manages the lifecycle of a single control-plane connection:
 // registration handshake → message loop → cleanup.
@@ -142,18 +128,22 @@ func HandleControlConn(
 		return
 	}
 
+	// Serialising writer that owns this control connection: every write (proxy
+	// OpenConnection, SOCKS frames, tunnel responses, heartbeat) goes through it
+	// so length-prefix + body stay atomic relative to concurrent writers.
+	cw := tunnel.NewCtrlConnWriter(conn)
+
 	// Register control connection in ControlConnRegistry if provided.
 	var ccReg *tunnel.ControlConnRegistry
 	if len(ctrlConns) > 0 && ctrlConns[0] != nil {
 		ccReg = ctrlConns[0]
-		ccReg.Register(client.ID, conn)
+		ccReg.Register(client.ID, cw)
 	}
 
 	// Server-side SOCKS mux — one per control connection.
 	// Each entry represents an internet target the server has dialled on behalf
 	// of the client's local SOCKS5 user.
 	serverMux := tunnel.NewSOCKSMux()
-	cw := &serverCtrlWriter{conn: conn}
 
 	// Ensure cleanup runs regardless of how we exit.
 	defer func() {
@@ -221,7 +211,7 @@ func HandleControlConn(
 					"reason", disc.Reason,
 				)
 			}
-			if err := protocol.WriteMessage(conn, protocol.MsgDisconnectAck, protocol.DisconnectAck{}); err != nil {
+			if err := cw.Write(protocol.MsgDisconnectAck, protocol.DisconnectAck{}); err != nil {
 				log.Debug("failed to send DisconnectAck", "id", client.ID, "err", err)
 			}
 			return
@@ -231,21 +221,21 @@ func HandleControlConn(
 				log.Warn("tunnel manager not configured, ignoring RequestTunnel", "id", client.ID)
 				continue
 			}
-			handleRequestTunnel(clientCtx, env, client, conn, mgr, dataAddr, log)
+			handleRequestTunnel(clientCtx, env, client, cw, mgr, dataAddr, log)
 
 		case protocol.MsgRequestHTTPTunnel:
 			if mgr == nil {
 				log.Warn("tunnel manager not configured, ignoring RequestHTTPTunnel", "id", client.ID)
 				continue
 			}
-			handleRequestHTTPTunnel(env, client, conn, mgr, dataAddr, log)
+			handleRequestHTTPTunnel(env, client, cw, mgr, dataAddr, log)
 
 		case protocol.MsgRequestHTTPSTunnel:
 			if mgr == nil {
 				log.Warn("tunnel manager not configured, ignoring RequestHTTPSTunnel", "id", client.ID)
 				continue
 			}
-			handleRequestHTTPSTunnel(env, client, conn, mgr, dataAddr, log)
+			handleRequestHTTPSTunnel(env, client, cw, mgr, dataAddr, log)
 
 		// ------------------------------------------------------------------
 		// Reversed SOCKS5 messages (Phase 4 reversed):
@@ -290,7 +280,7 @@ func HandleControlConn(
 func handleServerSOCKSConnect(
 	ctx context.Context,
 	sc protocol.SOCKSConnect,
-	cw *serverCtrlWriter,
+	cw *tunnel.CtrlConnWriter,
 	mux *tunnel.SOCKSMux,
 	log *slog.Logger,
 ) {
@@ -368,7 +358,7 @@ func handleServerSOCKSConnect(
 func handleRequestHTTPTunnel(
 	env *protocol.Envelope,
 	client *Client,
-	conn net.Conn,
+	cw *tunnel.CtrlConnWriter,
 	mgr *tunnel.Manager,
 	dataAddr string,
 	log *slog.Logger,
@@ -376,7 +366,7 @@ func handleRequestHTTPTunnel(
 	var req protocol.RequestHTTPTunnel
 	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&req); err != nil {
 		log.Warn("failed to decode RequestHTTPTunnel", "id", client.ID, "err", err)
-		if werr := protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
+		if werr := cw.Write(protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
 			Status: "error",
 			Error:  "malformed RequestHTTPTunnel payload",
 		}); werr != nil {
@@ -384,7 +374,7 @@ func handleRequestHTTPTunnel(
 		}
 		return
 	}
-	handleHTTPTunnelRequest(false, req.Hostname, req.LocalHost, req.LocalPort, client, conn, mgr, dataAddr, log)
+	handleHTTPTunnelRequest(false, req.Hostname, req.LocalHost, req.LocalPort, client, cw, mgr, dataAddr, log)
 }
 
 // handleRequestHTTPSTunnel processes a MsgRequestHTTPSTunnel from a client.
@@ -392,7 +382,7 @@ func handleRequestHTTPTunnel(
 func handleRequestHTTPSTunnel(
 	env *protocol.Envelope,
 	client *Client,
-	conn net.Conn,
+	cw *tunnel.CtrlConnWriter,
 	mgr *tunnel.Manager,
 	dataAddr string,
 	log *slog.Logger,
@@ -400,7 +390,7 @@ func handleRequestHTTPSTunnel(
 	var req protocol.RequestHTTPSTunnel
 	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&req); err != nil {
 		log.Warn("failed to decode RequestHTTPSTunnel", "id", client.ID, "err", err)
-		if werr := protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
+		if werr := cw.Write(protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
 			Status: "error",
 			Error:  "malformed RequestHTTPSTunnel payload",
 		}); werr != nil {
@@ -408,7 +398,7 @@ func handleRequestHTTPSTunnel(
 		}
 		return
 	}
-	handleHTTPTunnelRequest(true, req.Hostname, req.LocalHost, req.LocalPort, client, conn, mgr, dataAddr, log)
+	handleHTTPTunnelRequest(true, req.Hostname, req.LocalHost, req.LocalPort, client, cw, mgr, dataAddr, log)
 }
 
 // handleHTTPTunnelRequest contains the shared logic for registering an HTTP or
@@ -418,7 +408,7 @@ func handleHTTPTunnelRequest(
 	hostname, localHost string,
 	localPort int,
 	client *Client,
-	conn net.Conn,
+	cw *tunnel.CtrlConnWriter,
 	mgr *tunnel.Manager,
 	dataAddr string,
 	log *slog.Logger,
@@ -441,7 +431,7 @@ func handleHTTPTunnelRequest(
 		"localPort", localPort,
 	)
 
-	_ = protocol.WriteMessage(conn, protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
+	_ = cw.Write(protocol.MsgHTTPTunnelResp, protocol.HTTPTunnelResp{
 		Hostname:       hostname,
 		TunnelID:       tunnelID,
 		ServerDataAddr: dataAddr,
@@ -455,7 +445,7 @@ func handleRequestTunnel(
 	ctx context.Context,
 	env *protocol.Envelope,
 	client *Client,
-	conn net.Conn,
+	cw *tunnel.CtrlConnWriter,
 	mgr *tunnel.Manager,
 	dataAddr string,
 	log *slog.Logger,
@@ -463,7 +453,7 @@ func handleRequestTunnel(
 	var req protocol.RequestTunnel
 	if err := gob.NewDecoder(bytes.NewReader(env.Payload)).Decode(&req); err != nil {
 		log.Warn("failed to decode RequestTunnel", "id", client.ID, "err", err)
-		if werr := protocol.WriteMessage(conn, protocol.MsgTunnelResp, protocol.TunnelResp{
+		if werr := cw.Write(protocol.MsgTunnelResp, protocol.TunnelResp{
 			Status: "error",
 			Error:  "malformed RequestTunnel payload",
 		}); werr != nil {
@@ -478,7 +468,7 @@ func handleRequestTunnel(
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Error("failed to open public listener", "id", client.ID, "addr", listenAddr, "err", err)
-		if werr := protocol.WriteMessage(conn, protocol.MsgTunnelResp, protocol.TunnelResp{
+		if werr := cw.Write(protocol.MsgTunnelResp, protocol.TunnelResp{
 			Status: "error",
 			Error:  fmt.Sprintf("could not listen on %s: %v", listenAddr, err),
 		}); werr != nil {
@@ -501,7 +491,7 @@ func handleRequestTunnel(
 	)
 
 	// Reply to the client with the assigned tunnel info.
-	if err := protocol.WriteMessage(conn, protocol.MsgTunnelResp, protocol.TunnelResp{
+	if err := cw.Write(protocol.MsgTunnelResp, protocol.TunnelResp{
 		TunnelID:       tunnelID,
 		PublicPort:     publicPort,
 		ServerDataAddr: dataAddr,
@@ -513,5 +503,5 @@ func handleRequestTunnel(
 	}
 
 	// Start the public listener goroutine.
-	go tunnel.StartPublicListener(ctx, entry, conn, mgr, log)
+	go tunnel.StartPublicListener(ctx, entry, cw, mgr, log)
 }
