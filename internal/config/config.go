@@ -50,6 +50,10 @@ type ServerConfig struct {
 	AdminToken string `yaml:"admin_token"`
 	// MinPort is the minimum allowed destination port for SOCKS/tunnel connections (default 1).
 	MinPort int `yaml:"min_port"`
+	// AllowPrivateTargets, when true, lets the SOCKS/HTTP-CONNECT/port-forward
+	// exit node dial loopback/private/link-local addresses. Default false blocks
+	// them (SSRF guard). Enable only when intentionally proxying to internal hosts.
+	AllowPrivateTargets bool `yaml:"allow_private_targets"`
 	// Insecure skips TLS certificate verification when dialing clients (development only).
 	Insecure bool `yaml:"insecure"`
 	// ClientCACert is the path to a CA certificate for verifying client TLS certificates.
@@ -85,10 +89,15 @@ func DefaultServerConfig() *ServerConfig {
 		HTTPAddr:       ":8080",
 		HTTPSAddr:      ":8445",
 		AdminAddr:      ":9090",
-		AuthToken:      "changeme",
-		CertPath:       "server.crt",
-		KeyPath:        "server.key",
-		Insecure:       true,
+		// AuthToken intentionally empty: the operator MUST supply a strong token.
+		// ValidateSecurity fails closed on an empty/"changeme" token unless
+		// Insecure (development mode) is explicitly enabled.
+		AuthToken: "",
+		CertPath:  "server.crt",
+		KeyPath:   "server.key",
+		// Insecure defaults to false (TLS verification ON). Use tls_fingerprint or
+		// client_ca_cert for self-signed clients; set insecure: true only for dev.
+		Insecure:       false,
 		MinPort:        1,
 		LogLevel:       "info",
 		KnownHostsPath: "known_hosts.yaml",
@@ -147,9 +156,13 @@ type ClientConfig struct {
 	// HTTP CONNECT proxy (reversed architecture — listener is on the CLIENT side).
 
 	// HTTPProxyAddr is the local address on which the client runs the HTTP CONNECT
-	// proxy listener (default ":8080").  Set to "" to disable.
+	// proxy listener (default "127.0.0.1:8080").  Set to "" to disable.
 	// Use HTTPS_PROXY=http://127.0.0.1:8080 to route traffic through this proxy.
 	HTTPProxyAddr string `yaml:"http_proxy_addr"`
+	// HTTPProxyUser/HTTPProxyPass enable HTTP Basic proxy authentication on the
+	// HTTP CONNECT listener (empty = no auth). Required when binding non-loopback.
+	HTTPProxyUser string `yaml:"http_proxy_user"`
+	HTTPProxyPass string `yaml:"http_proxy_pass"`
 
 	// PortForwards defines local TCP port forwards through the SOCKS5 tunnel.
 	// Each entry listens on a local port and forwards to a remote host:port
@@ -218,17 +231,62 @@ func DefaultFileTransferConfig() FileTransferConfig {
 // DefaultClientConfig returns a ClientConfig populated with sensible defaults.
 func DefaultClientConfig() *ClientConfig {
 	return &ClientConfig{
-		ListenAddr:    ":8443",
-		AuthToken:     "changeme",
-		Name:          "client1",
-		Insecure:      true,
-		LogLevel:      "info",
-		CertPath:      "client.crt",
-		KeyPath:       "client.key",
-		SOCKSAddr:     ":1080",
-		HTTPProxyAddr: ":8080",
+		ListenAddr: ":8443",
+		// AuthToken intentionally empty — see DefaultServerConfig.
+		AuthToken: "",
+		Name:      "client1",
+		// Insecure defaults to false — see DefaultServerConfig.
+		Insecure: false,
+		LogLevel: "info",
+		CertPath: "client.crt",
+		KeyPath:  "client.key",
+		// SOCKS5 / HTTP-CONNECT proxies bind to loopback by default so they are
+		// not an open relay reachable from the LAN. Override + add auth to expose.
+		SOCKSAddr:     "127.0.0.1:1080",
+		HTTPProxyAddr: "127.0.0.1:8080",
 		FileTransfer:  DefaultFileTransferConfig(),
 	}
+}
+
+// -----------------------------------------------------------------------
+// Security validation
+// -----------------------------------------------------------------------
+
+// isWeakToken reports whether t is unusable as an authenticator: empty or the
+// well-known shipped default.
+func isWeakToken(t string) bool {
+	return t == "" || t == "changeme"
+}
+
+// ValidateSecurity rejects insecure credential configurations unless the
+// operator has explicitly opted into development mode (Insecure=true). It is
+// the fail-closed startup check that replaces the old "warn and continue".
+func (c *ServerConfig) ValidateSecurity() error {
+	if c.Insecure {
+		return nil // development mode: weak credentials tolerated
+	}
+	if isWeakToken(c.AuthToken) {
+		return fmt.Errorf("auth_token is empty or the well-known default %q — set a strong token, or set insecure: true for development", "changeme")
+	}
+	for _, cl := range c.Clients {
+		// An empty per-client token inherits the (already validated) server token.
+		if cl.AuthToken != "" && isWeakToken(cl.AuthToken) {
+			return fmt.Errorf("client %q auth_token is the well-known default %q", cl.Name, "changeme")
+		}
+	}
+	return nil
+}
+
+// ValidateSecurity rejects a missing/default client auth_token unless the
+// operator has explicitly opted into development mode (Insecure=true).
+func (c *ClientConfig) ValidateSecurity() error {
+	if c.Insecure {
+		return nil
+	}
+	if isWeakToken(c.AuthToken) {
+		return fmt.Errorf("auth_token is empty or the well-known default %q — set a strong token, or set insecure: true for development", "changeme")
+	}
+	return nil
 }
 
 // -----------------------------------------------------------------------
