@@ -73,6 +73,8 @@ type ServerConfig struct {
 	// AutoApprove disables the TOFU prompt and trusts every connecting client
 	// (only safe for closed dev networks).
 	AutoApprove bool `yaml:"auto_approve"`
+	// FileTransfer configures the right-click / drop-folder file transfer feature.
+	FileTransfer FileTransferConfig `yaml:"file_transfer"`
 }
 
 // DefaultServerConfig returns a ServerConfig populated with production-ready
@@ -90,6 +92,7 @@ func DefaultServerConfig() *ServerConfig {
 		MinPort:        1,
 		LogLevel:       "info",
 		KnownHostsPath: "known_hosts.yaml",
+		FileTransfer:   DefaultFileTransferConfig(),
 	}
 }
 
@@ -152,6 +155,9 @@ type ClientConfig struct {
 	// Each entry listens on a local port and forwards to a remote host:port
 	// through the server's internet connection.
 	PortForwards []PortForwardConfig `yaml:"port_forwards"`
+
+	// FileTransfer configures the right-click / drop-folder file transfer feature.
+	FileTransfer FileTransferConfig `yaml:"file_transfer"`
 }
 
 // PortForwardConfig describes a local TCP port forward through the tunnel.
@@ -166,6 +172,49 @@ type PortForwardConfig struct {
 	Bind string `yaml:"bind"`
 }
 
+// FileTransferConfig configures the bidirectional file-transfer feature that
+// powers the Windows right-click "파일 전송" action. The same struct is embedded
+// in both ClientConfig and ServerConfig so either peer role can send and receive.
+//
+// Transport reuses the existing tunnel: the receive endpoint binds to a local
+// address (ReceiveAddr) which is exposed to the peer through a normal tunnel,
+// and the sender uploads over HTTP (chunked, sha256-verified, resumable).
+type FileTransferConfig struct {
+	// Enabled turns the file-transfer receive listener on.
+	Enabled bool `yaml:"enabled"`
+	// ReceiveAddr is the local address the file-receive HTTP endpoint binds to
+	// (default "127.0.0.1:8089"). It is meant to be exposed to the peer via a tunnel.
+	ReceiveAddr string `yaml:"receive_addr"`
+	// DropDir is the directory where received files are written. Required when
+	// Enabled; relative paths are resolved against the working directory.
+	DropDir string `yaml:"drop_dir"`
+	// Token is a shared secret required on uploads (defense-in-depth beyond the
+	// tunnel's TLS + auth token). Empty = no upload auth.
+	Token string `yaml:"token"`
+	// MaxFileSize caps a single received file in bytes (0 = unlimited).
+	MaxFileSize int64 `yaml:"max_file_size"`
+
+	// SendEndpoint is the peer's receive endpoint as reachable from THIS host
+	// through the tunnel (e.g. "http://127.0.0.1:8090" mapped by a port-forward,
+	// or the server's public port). Used by the right-click "send" action.
+	SendEndpoint string `yaml:"send_endpoint"`
+	// ControlAddr is the loopback address the resident tray agent listens on for
+	// local "send this file" requests from the Explorer context-menu helper
+	// (default "127.0.0.1:8077"). Windows-only; ignored elsewhere.
+	ControlAddr string `yaml:"control_addr"`
+}
+
+// DefaultFileTransferConfig returns disabled-by-default file-transfer settings
+// with sensible addresses/paths to fill in once enabled.
+func DefaultFileTransferConfig() FileTransferConfig {
+	return FileTransferConfig{
+		Enabled:     false,
+		ReceiveAddr: "127.0.0.1:8089",
+		DropDir:     "received",
+		ControlAddr: "127.0.0.1:8077",
+	}
+}
+
 // DefaultClientConfig returns a ClientConfig populated with sensible defaults.
 func DefaultClientConfig() *ClientConfig {
 	return &ClientConfig{
@@ -178,6 +227,7 @@ func DefaultClientConfig() *ClientConfig {
 		KeyPath:       "client.key",
 		SOCKSAddr:     ":1080",
 		HTTPProxyAddr: ":8080",
+		FileTransfer:  DefaultFileTransferConfig(),
 	}
 }
 

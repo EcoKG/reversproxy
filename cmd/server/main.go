@@ -16,6 +16,7 @@ import (
 	"github.com/EcoKG/reversproxy/internal/admin"
 	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/control"
+	"github.com/EcoKG/reversproxy/internal/filetransfer"
 	"github.com/EcoKG/reversproxy/internal/logger"
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/reconnect"
@@ -172,6 +173,18 @@ func main() {
 			os.Exit(1)
 		}
 		log.Info("admin API started", "addr", cfg.AdminAddr)
+	}
+
+	// Start the file-transfer receiver (drop folder) if enabled. The receive
+	// endpoint is meant to be reached by the peer through a tunnel / port-forward.
+	if cfg.FileTransfer.Enabled {
+		if recv, ferr := filetransfer.NewReceiver(cfg.FileTransfer.DropDir, cfg.FileTransfer.Token, cfg.FileTransfer.MaxFileSize, log); ferr != nil {
+			log.Error("file transfer: receiver init failed", "err", ferr)
+		} else if ftAddr, serr := filetransfer.StartReceiver(ctx, cfg.FileTransfer.ReceiveAddr, recv); serr != nil {
+			log.Error("file transfer: receiver start failed", "addr", cfg.FileTransfer.ReceiveAddr, "err", serr)
+		} else {
+			log.Info("file transfer receiver listening", "addr", ftAddr, "drop_dir", recv.Dir())
+		}
 	}
 
 	// ------------------------------------------------------------------ //

@@ -130,17 +130,18 @@
 
 ## 설치
 
-릴리스 워크플로(GitHub Actions)는 태그 푸시(`v*`) 시 6개의 빌드 잡을 정의하지만, **현재 `cmd/winclient`(Windows systray GUI)가 컴파일되지 않아** 릴리스 잡이 실패하며, 실제로 산출되는 아티팩트는 다음 5종입니다(아래 "프로젝트 구조" 참고).
+릴리스 워크플로(GitHub Actions)는 태그 푸시(`v*`) 시 다음 6종 아티팩트를 크로스 컴파일해 릴리스에 업로드합니다(모두 **순수 Go, CGO 불필요**).
 
 | 아티팩트 | 대상 | 비고 |
 |----------|------|------|
 | `reversproxy-client-linux-amd64` | Linux 클라이언트 (x86_64) | CLI |
 | `reversproxy-client-linux-arm64` | Linux 클라이언트 (arm64) | CLI |
-| `reversproxy-server-linux-amd64` | Linux 서버 (x86_64) | |
-| `reversproxy-server-linux-arm64` | Linux 서버 (arm64) | |
+| `reversproxy-client-windows-amd64.exe` | Windows 클라이언트 | GUI 시스템 트레이 |
+| `reversproxy-server-linux-amd64` | Linux 서버 (x86_64) | CLI |
+| `reversproxy-server-linux-arm64` | Linux 서버 (arm64) | CLI |
 | `reversproxy-server-windows-amd64.exe` | Windows 서버 | CLI |
 
-> ⚠ `reversproxy-client-windows-amd64.exe`(systray GUI, `cmd/winclient`)는 멀티 서버 리팩토링 이후 빌드가 깨져 있어 현재 배포되지 않습니다. Windows에서 클라이언트가 필요하면 CLI 클라이언트(`cmd/client`)를 직접 빌드해 사용하시기 바랍니다.
+> 클라이언트 형태: **리눅스 = CLI(`cmd/client`), 윈도우 = GUI 시스템 트레이(`cmd/winclient`)**. 서버는 양쪽 모두 CLI입니다. 윈도우 GUI 클라이언트는 드롭 폴더 수신 + 탐색기 우클릭 파일 전송을 지원합니다([FILE_TRANSFER.md](FILE_TRANSFER.md)).
 
 ### Linux 클라이언트 (원라이너)
 
@@ -180,6 +181,22 @@ Start-Service reversproxy-server
 Get-Service reversproxy-server
 ```
 
+### Windows 클라이언트 (GUI 트레이, PowerShell — 관리자 권한 불필요)
+
+```powershell
+irm https://raw.githubusercontent.com/EcoKG/reversproxy/master/scripts/install-client.ps1 | iex
+```
+
+이 스크립트는 다음을 수행합니다:
+
+1. 최신 릴리스에서 `reversproxy-client-windows-amd64.exe`(systray GUI)를 `%LOCALAPPDATA%\reversproxy`에 내려받습니다.
+2. 기본 `config.yaml`을 생성합니다(`file_transfer` 블록 포함).
+3. 로그온 시 자동 시작을 등록합니다(HKCU Run 키).
+4. 탐색기 우클릭 **"Reversproxy로 파일 전송"** 메뉴를 등록합니다(`register-menu`).
+5. 트레이 클라이언트를 실행합니다.
+
+트레이 메뉴에서 연결/해제, 수신함 열기, 우클릭 메뉴 등록·해제가 가능합니다. 파일 전송 배선은 [FILE_TRANSFER.md](FILE_TRANSFER.md)를 참고하십시오.
+
 ### go install
 
 ```bash
@@ -187,7 +204,7 @@ go install github.com/EcoKG/reversproxy/cmd/server@latest
 go install github.com/EcoKG/reversproxy/cmd/client@latest
 ```
 
-(`cmd/winclient`는 현재 컴파일되지 않으므로 설치할 수 없습니다. Windows에서는 CLI 클라이언트 `cmd/client`를 직접 빌드해 사용하시기 바랍니다.)
+(`cmd/winclient`는 GUI 트레이 앱입니다. `go install`로도 받을 수 있으나 콘솔 창 억제(`-H windowsgui`)가 적용되지 않으므로, 위 install-client.ps1 또는 릴리스 바이너리 사용을 권장합니다.)
 
 ### 바이너리 직접 다운로드
 
@@ -536,51 +553,59 @@ curl https://httpbin.org/ip
 ### 로컬 빌드
 
 ```bash
-go build -o reversproxy-server ./cmd/server   # 정상 빌드
-go build -o reversproxy-client ./cmd/client   # 정상 빌드
+go build ./...                                # server / client / winclient 전체 정상 빌드
+go build -o reversproxy-server ./cmd/server
+go build -o reversproxy-client ./cmd/client
 ```
 
-> 주의: `go build ./...`는 Windows에서 `cmd/winclient` 컴파일 실패로 함께 실패합니다(아래 winclient 경고 참고). 동작하는 진입점은 `cmd/server`와 `cmd/client` 두 개입니다.
+> 세 진입점(`cmd/server`, `cmd/client`, `cmd/winclient`) 모두 정상 빌드됩니다. winclient는 `//go:build windows`라 비-윈도우 호스트의 `go build ./...`에서는 자동 제외됩니다.
 
 ### 크로스 컴파일
 
+권장: 빌드 스크립트가 server + client(리눅스 CLI / 윈도우 GUI 트레이)를 양 OS로 한 번에 산출하고, `dist/release/`에 릴리스용 명명 사본까지 생성합니다.
+
 ```bash
-# Linux 서버 (arm64)
-GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o reversproxy-server-linux-arm64 ./cmd/server
-
-# Windows 서버 (CLI, amd64)
-GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o reversproxy-server-windows-amd64.exe ./cmd/server
-
-# Windows 클라이언트 (systray GUI) — ⚠ 현재 컴파일되지 않음
-GOOS=windows GOARCH=amd64 CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc \
-  go build -ldflags "-H windowsgui -s -w" -o reversproxy-client-windows-amd64.exe ./cmd/winclient
+./scripts/build.sh                    # Linux/macOS/WSL → dist/
+./scripts/build.ps1                   # Windows(PowerShell) → dist\
+TARGET_OS=windows ./scripts/build.sh  # 특정 OS만 (변수명은 OS 아님)
 ```
 
-> ⚠ **`cmd/winclient`는 현재 컴파일되지 않습니다.** 멀티 서버 리팩토링(`ServerPool`/`ServerSession` 도입) 이후 `socks.StartClientSOCKSProxy`/`StartHTTPConnectProxy`/`StartPortForward`와 `client.HandleServerConn`의 시그니처가 바뀌었으나 `cmd/winclient/main.go`가 옛 시그니처로 호출하고 있어 빌드가 실패합니다(서버·CLI 클라이언트는 정상 빌드). 빌드하려면 winclient를 새 `ServerPool` API에 맞게 먼저 수정해야 합니다. systray GUI 빌드 자체는 `CGO_ENABLED=1`과 `-H windowsgui`, 크로스 컴파일 시 `x86_64-w64-mingw32-gcc`(MinGW)를 요구합니다.
+개별 명령(모두 **순수 Go, CGO·MinGW 불필요**):
+
+```bash
+# Linux 서버 (arm64)
+GOOS=linux   GOARCH=arm64 CGO_ENABLED=0 go build -ldflags "-s -w" -o reversproxy-server-linux-arm64 ./cmd/server
+# Windows 서버 (CLI, amd64)
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-s -w" -o reversproxy-server-windows-amd64.exe ./cmd/server
+# Windows 클라이언트 (systray GUI) — 콘솔 창 억제(-H windowsgui)
+GOOS=windows GOARCH=amd64 CGO_ENABLED=0 go build -ldflags "-H windowsgui -s -w" -o reversproxy-client-windows-amd64.exe ./cmd/winclient
+```
 
 ### Makefile 타깃
 
 ```bash
-make build    # go build ./...
-make test     # go test -race ./...
-make lint     # go vet ./...
+make build         # go build ./...
+make test          # go test -race ./...
+make lint          # go vet ./...
+make dist          # Linux+Windows 크로스 컴파일 → dist/ (= build-all)
+make run-server    # go run ./cmd/server -data-addr :8444 -token changeme
+make run-client    # go run ./cmd/client -listen :8443 -token changeme -name client1
 ```
-
-> **경고**: 현재 `Makefile`의 `run-server`(`-addr`/`-token`), `run-client`(`-server`), `cert`(`-gencert`) 타깃은 **실제 CLI와 맞지 않아 "flag provided but not defined" 오류로 실패**합니다(서버에는 `-addr`/`-gencert`가 없고, 클라이언트는 다이얼하지 않으므로 `-server`가 없습니다). 직접 실행 시 위의 `go run`/`go build` 명령과 본문의 CLI 플래그를 사용하시기 바랍니다.
 
 ---
 
 ## 프로젝트 구조
 
-모듈 경로: `github.com/EcoKG/reversproxy` (Go 1.22.10). 직접 의존성: `getlantern/systray`(winclient 전용), `google/uuid`, `gopkg.in/yaml.v3`.
+모듈 경로: `github.com/EcoKG/reversproxy` (Go 1.22.10). 직접 의존성: `getlantern/systray` · `golang.org/x/sys`(winclient 전용), `google/uuid`, `gopkg.in/yaml.v3`.
 
 ```
 cmd/
   client/        CLI 클라이언트 진입점 (tls.Listen, ServerPool, 출구 프런트엔드 기동)
   server/        서버 진입점 (dialClientLoop, tofuCheck, 공개 리스너, 관리 서버)
-  winclient/     Windows 시스템 트레이 GUI 클라이언트 (//go:build windows, CGO 필요) — ⚠ 현재 미컴파일(stale)
+  winclient/     Windows 시스템 트레이 GUI 클라이언트 (//go:build windows, 순수 Go) — 우클릭 파일전송 통합(shellext.go)
 internal/
   config/        YAML 설정 로딩 (KnownFields 엄격), 기본값, 컴파일 타임 상수
+  filetransfer/  재개·SHA-256 검증 가능한 파일 전송(수신기/송신기) — 우클릭/CLI 전송의 코어
   control/       제어 평면: 핸드셰이크, 하트비트, TOFU 승인(approval), known_hosts, TLS, 레지스트리
   client/        클라이언트 측 세션 처리: HandleServerConn, ServerPool, ConnWriter
   protocol/      와이어 프로토콜: 길이 접두 + gob Envelope 프레이밍, 메시지 타입, 대상 검증
@@ -592,11 +617,11 @@ internal/
   reconnect/     지수 백오프 + 재연결 설정 헬퍼
   proxy/         빈 플레이스홀더 (stub.go — 미구현)
   app/           ServerApp 추상화 (테스트 전용, 운영 서버는 cmd/server 사용)
-scripts/         install-client.sh, install-server.ps1, run-client.sh, patch-client.sh
+scripts/         build.sh / build.ps1 (크로스 빌드), install-client.sh / install-client.ps1, install-server.ps1, run-client.sh, patch-client.sh
 .github/workflows/release.yml   태그 푸시 시 6종 아티팩트 크로스 컴파일 + 릴리스
 ```
 
-> 참고: `cmd/winclient`는 멀티 서버 리팩토링 이후 옛 함수 시그니처를 호출하여 **현재 컴파일되지 않는 stale 코드**입니다(동작하는 진입점은 `cmd/server`와 `cmd/client`뿐). `internal/proxy/stub.go`는 미구현 빈 스텁이며 실제 데이터 평면은 `internal/tunnel`에 있습니다. `internal/app`의 `ServerApp`는 테스트 전용으로, TOFU/EventBus/승인 배선이 빠져 있어 운영 진입점이 아닙니다. `internal/socks/server.go`(서버 측 SOCKS)는 더 이상 `cmd/server`에서 사용되지 않는 레거시 코드입니다.
+> 참고: 세 진입점(`cmd/server`·`cmd/client`·`cmd/winclient`)이 모두 정상 빌드됩니다. `internal/proxy/stub.go`는 미구현 빈 스텁이며 실제 데이터 평면은 `internal/tunnel`에 있습니다. `internal/app`의 `ServerApp`는 테스트 전용으로, TOFU/EventBus/승인 배선이 빠져 있어 운영 진입점이 아닙니다. `internal/socks/server.go`(서버 측 SOCKS)는 더 이상 `cmd/server`에서 사용되지 않는 레거시 코드입니다.
 
 ---
 

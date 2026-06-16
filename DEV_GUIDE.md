@@ -44,17 +44,38 @@ go test ./...
 ```
 
 ### 빌드 명령어
+
+빌드 매트릭스 — 서버는 양쪽 OS 모두 CLI, 클라이언트는 **리눅스=CLI / 윈도우=GUI 트레이**입니다.
+
+| | Linux | Windows |
+|---|---|---|
+| **server** | `dist/linux/reversproxy-server` (CLI) | `dist/windows/reversproxy-server.exe` (CLI) |
+| **client** | `dist/linux/reversproxy-client` (CLI, `cmd/client`) | `dist/windows/reversproxy-client.exe` (GUI 트레이, `cmd/winclient`) |
+
+CGO 없이(순수 Go) 빌드하므로 C 컴파일러 없이 어떤 호스트에서도 양쪽 OS 바이너리를 만들 수 있습니다.
+윈도우 GUI 클라이언트는 `-H windowsgui`로 빌드되어 실행 시 콘솔 창이 뜨지 않습니다.
+
 ```bash
-# 네이티브 빌드
-go build -o client ./cmd/client
-go build -o server ./cmd/server
+# 권장: 빌드 스크립트로 전체(Linux+Windows) 산출 → dist/ 에 생성
+./scripts/build.sh                    # Linux/macOS/WSL
+TARGET_OS=windows ./scripts/build.sh  # Windows 만 (변수명은 OS 아님 — Windows의 OS=Windows_NT 와 충돌)
+ARCH=arm64 ./scripts/build.sh         # arm64 대상
 
-# 크로스 컴파일
-make build-all
+# Windows 호스트(PowerShell)
+./scripts/build.ps1                # 전체
+./scripts/build.ps1 -Os linux      # Linux 만
 
-# 특정 플랫폼
-GOOS=linux GOARCH=amd64 go build -o reversproxy-client ./cmd/client
-GOOS=windows GOARCH=amd64 go build -o reversproxy-server.exe ./cmd/server
+# Make 타깃
+make dist                          # = build-all, 전체 크로스컴파일
+make dist-linux                    # 리눅스 서버 + CLI 클라이언트
+make dist-windows                  # 윈도우 서버 + GUI 트레이 클라이언트
+make server-linux client-windows   # 개별 타깃
+
+# 단발 수동 빌드 예시
+GOOS=linux   GOARCH=amd64 go build -o reversproxy-client      ./cmd/client     # 리눅스 CLI 클라이언트
+GOOS=windows GOARCH=amd64 go build -o reversproxy-server.exe  ./cmd/server     # 윈도우 CLI 서버
+GOOS=windows GOARCH=amd64 go build -ldflags '-H windowsgui' \
+    -o reversproxy-client.exe ./cmd/winclient                                  # 윈도우 GUI 트레이 클라이언트
 ```
 
 ## 코드 구조 가이드
@@ -62,8 +83,9 @@ GOOS=windows GOARCH=amd64 go build -o reversproxy-server.exe ./cmd/server
 ### 핵심 패키지 역할
 
 #### 1. `cmd/` - 애플리케이션 진입점
-- **client**: 클라이언트 애플리케이션
-- **server**: 서버 애플리케이션
+- **client**: CLI 클라이언트 (크로스플랫폼; 리눅스 기본 클라이언트)
+- **server**: 서버 애플리케이션 (크로스플랫폼 CLI)
+- **winclient**: 윈도우 GUI 시스템 트레이 클라이언트 (`//go:build windows`; `cmd/client`와 동일한 `internal/client` 로직을 트레이 UI로 감쌈)
 
 #### 2. `internal/` - 비공개 라이브러리
 
