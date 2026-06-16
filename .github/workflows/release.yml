@@ -18,8 +18,7 @@ jobs:
           - cmd: winclient
             goos: windows
             goarch: amd64
-            cgo: "1"
-            cc: x86_64-w64-mingw32-gcc
+            cgo: "0"
             output: reversproxy-client-windows-amd64.exe
             ldflags: "-H windowsgui -s -w"
           - cmd: client
@@ -61,10 +60,6 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
-
-      - name: Install MinGW (Windows cross-compile)
-        if: matrix.cgo == '1'
-        run: sudo apt-get install -y gcc-mingw-w64-x86-64
 
       - name: Build
         env:
