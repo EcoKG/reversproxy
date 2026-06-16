@@ -61,6 +61,15 @@ clients:
   # - name: "client2"
   #   address: "192.168.1.20:8443"
   #   auth_token: "changeme"
+
+# (선택) 파일 전송 — 드롭 폴더 수신 + 우클릭/CLI 전송. 자세한 배선은 FILE_TRANSFER.md 참고.
+file_transfer:
+  enabled: false
+  receive_addr: "127.0.0.1:8089"      # 수신기(루프백) — 터널로 클라이언트에 노출
+  drop_dir: "received"                 # 받은 파일 저장 폴더
+  token: "changeme-ft"                 # 양쪽 동일하게 설정 권장
+  # send_endpoint: "http://127.0.0.1:18089"  # 클라이언트 수신기로 닿는 공개 포트(보낼 때)
+  max_file_size: 0
 "@ | Set-Content -Path $ConfigPath -Encoding UTF8
 }
 

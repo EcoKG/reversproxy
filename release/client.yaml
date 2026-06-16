@@ -17,3 +17,13 @@ tunnels:
     hostname: "test.local"
     local_host: "127.0.0.1"
     local_port: 3000
+
+# 파일 전송 (드롭 폴더 + 우클릭/CLI). 배선 설명은 FILE_TRANSFER.md 참고.
+file_transfer:
+  enabled: false
+  receive_addr: "127.0.0.1:8089"
+  drop_dir: "received"
+  token: "loopback-ft-token"
+  send_endpoint: "http://127.0.0.1:8090"
+  control_addr: "127.0.0.1:8077"
+  max_file_size: 0
