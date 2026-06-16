@@ -2,7 +2,8 @@
 
 // Package main implements a Windows system-tray GUI wrapper for the reversproxy client.
 // It provides the same tunnel/SOCKS/HTTP-proxy functionality as cmd/client/main.go,
-// exposed through a taskbar tray icon instead of a CLI.
+// exposed through a taskbar tray icon, a native management console (lxn/walk), and a
+// settings dialog instead of a CLI.
 package main
 
 import (
@@ -27,7 +28,7 @@ import (
 	"github.com/getlantern/systray"
 )
 
-//go:embed assets/icon.png
+//go:embed assets/icon.ico
 var iconData []byte
 
 // connStateVal represents the current tunnel connection state.
@@ -39,13 +40,20 @@ const (
 	stateConnected
 )
 
-// currentState tracks live connection status for tray updates.
+// currentState tracks live connection status for the tray toggle logic.
 var currentState atomic.Int32
 
-// cancelFn holds the current tunnel context canceller. Protected by mu.
+// Process-wide control state, set up in onReady and used by the tray loop, the
+// management console, and the settings dialog.
 var (
-	mu       sync.Mutex
-	cancelFn context.CancelFunc
+	mu          sync.Mutex
+	cancelFn    context.CancelFunc // cancels the current tunnel context
+	rootCtx     context.Context    // parent context for all tunnel runs
+	configPath  string
+	logPath     string
+	appLog      *slog.Logger
+	mStatusItem *systray.MenuItem
+	mToggleItem *systray.MenuItem
 )
 
 func main() {
@@ -62,9 +70,18 @@ func onReady() {
 	mStatus.Disable()
 	systray.AddSeparator()
 	mToggle := systray.AddMenuItem("연결", "서버에 연결/해제")
-	mConfig := systray.AddMenuItem("설정 파일 열기", "config.yaml 편집")
+	mReconnect := systray.AddMenuItem("재연결", "연결을 끊고 다시 연결")
+	systray.AddSeparator()
+	mConsole := systray.AddMenuItem("관리 콘솔 열기", "상태를 보는 관리 콘솔 창")
+	mSettings := systray.AddMenuItem("설정", "GUI로 설정 편집")
+	mConfigFile := systray.AddMenuItem("설정 파일 열기 (고급)", "config.yaml 직접 편집")
+	mLogs := systray.AddMenuItem("로그 파일 열기", "winclient.log 열기")
+	mAutostart := systray.AddMenuItemCheckbox("시작 시 자동 실행", "Windows 로그온 시 자동 시작", isAutoStartEnabled())
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("종료", "프로그램 종료")
+
+	mStatusItem = mStatus
+	mToggleItem = mToggle
 
 	// Determine exe directory; fall back to "." if os.Executable fails.
 	exePath, exeErr := os.Executable()
@@ -72,94 +89,81 @@ func onReady() {
 	if exeErr == nil {
 		exeDir = filepath.Dir(exePath)
 	}
-	configPath := filepath.Join(exeDir, "config.yaml")
+	configPath = filepath.Join(exeDir, "config.yaml")
+	logPath = filepath.Join(exeDir, "winclient.log")
 
 	// Open log file next to the executable.
-	logPath := filepath.Join(exeDir, "winclient.log")
 	logFile, logErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if logErr != nil {
 		showError("Reversproxy", "로그 파일을 열 수 없습니다:\n"+logErr.Error())
 		return
 	}
 	defer logFile.Close()
-	log := slog.New(slog.NewTextHandler(logFile, nil))
+	appLog = slog.New(slog.NewTextHandler(logFile, nil))
 
-	// Root context; replaced per-connection by toggle.
-	rootCtx, rootCancel := context.WithCancel(context.Background())
+	// Root context; child contexts are created per connection by startTunnel.
+	rc, rootCancel := context.WithCancel(context.Background())
+	rootCtx = rc
 	defer rootCancel()
 
 	mu.Lock()
 	cancelFn = rootCancel
 	mu.Unlock()
 
-	// Auto-connect on startup: check file existence first, then load.
+	status.setConfig(nil, configPath, logPath)
+
+	// Auto-connect on startup: create a default config if missing, else connect.
 	if _, statErr := os.Stat(configPath); os.IsNotExist(statErr) {
 		const tmpl = "listen_addr: \":8443\"\nauth_token: \"changeme\"\nname: \"my-pc\"\nlog_level: \"info\"\ninsecure: false\ntunnels: []\n"
 		if wErr := os.WriteFile(configPath, []byte(tmpl), 0644); wErr != nil {
-			log.Error("config.yaml 생성 실패", "err", wErr)
+			appLog.Error("config.yaml 생성 실패", "err", wErr)
 			showError("Reversproxy", "config.yaml 생성 실패:\n"+wErr.Error())
 		} else {
-			log.Info("config.yaml 생성됨", "path", configPath)
+			appLog.Info("config.yaml 생성됨", "path", configPath)
 			openConfigFile(configPath)
 		}
-		updateStatus(mStatus, mToggle, stateDisconnected)
+		updateStatus(stateDisconnected)
 	} else {
-		cfg, err := config.LoadClientConfig(configPath)
-		if err == nil {
-			ctx, cancel := context.WithCancel(rootCtx)
-			mu.Lock()
-			cancelFn = cancel
-			mu.Unlock()
-			go runTunnelLoop(ctx, cfg, mStatus, mToggle)
-		} else {
-			log.Error("config.yaml 로드 실패", "err", err)
-			showError("Reversproxy", "설정 파일 오류:\n"+err.Error())
-			updateStatus(mStatus, mToggle, stateDisconnected)
-		}
+		startTunnel()
 	}
 
 	// Menu event loop.
 	for {
 		select {
 		case <-mToggle.ClickedCh:
-			state := connStateVal(currentState.Load())
-			if state == stateDisconnected {
-				// Start connecting.
-				if _, statErr := os.Stat(configPath); os.IsNotExist(statErr) {
-					showError("Reversproxy", "config.yaml 파일이 없습니다.\n트레이 메뉴 → 설정 파일 열기를 눌러 설정 후 다시 시도하세요.")
-					updateStatus(mStatus, mToggle, stateDisconnected)
-					continue
-				}
-				reloadedCfg, loadErr := config.LoadClientConfig(configPath)
-				if loadErr != nil {
-					showError("Reversproxy", "설정 파일 오류:\n"+loadErr.Error())
-					updateStatus(mStatus, mToggle, stateDisconnected)
-					continue
-				}
-				ctx, cancel := context.WithCancel(rootCtx)
-				mu.Lock()
-				cancelFn = cancel
-				mu.Unlock()
-				go runTunnelLoop(ctx, reloadedCfg, mStatus, mToggle)
+			if connStateVal(currentState.Load()) == stateDisconnected {
+				startTunnel()
 			} else {
-				// Disconnect.
-				mu.Lock()
-				if cancelFn != nil {
-					cancelFn()
-				}
-				mu.Unlock()
-				updateStatus(mStatus, mToggle, stateDisconnected)
+				stopTunnel()
 			}
 
-		case <-mConfig.ClickedCh:
+		case <-mReconnect.ClickedCh:
+			reconnectTunnel()
+
+		case <-mConsole.ClickedCh:
+			openConsole()
+
+		case <-mSettings.ClickedCh:
+			openSettingsDialog()
+
+		case <-mConfigFile.ClickedCh:
 			openConfigFile(configPath)
 
-		case <-mQuit.ClickedCh:
-			mu.Lock()
-			if cancelFn != nil {
-				cancelFn()
+		case <-mLogs.ClickedCh:
+			openConfigFile(logPath)
+
+		case <-mAutostart.ClickedCh:
+			enable := !mAutostart.Checked()
+			if err := setAutoStart(enable); err != nil {
+				showError("Reversproxy", "자동 실행 설정 실패:\n"+err.Error())
+			} else if enable {
+				mAutostart.Check()
+			} else {
+				mAutostart.Uncheck()
 			}
-			mu.Unlock()
+
+		case <-mQuit.ClickedCh:
+			stopTunnel()
 			// Brief drain so goroutines see cancellation.
 			time.Sleep(500 * time.Millisecond)
 			systray.Quit()
@@ -172,15 +176,53 @@ func onReady() {
 // handles goroutine cleanup in onReady.
 func onExit() {}
 
-// runTunnelLoop starts the TLS listener and the accept loop.
-// It updates the tray status as connection state changes.
-// Runs until ctx is cancelled.
-func runTunnelLoop(
-	ctx context.Context,
-	cfg *config.ClientConfig,
-	mStatus *systray.MenuItem,
-	mToggle *systray.MenuItem,
-) {
+// startTunnel loads the config and starts the tunnel loop in a new context.
+// It is a no-op-with-error-dialog when the config is missing or invalid.
+func startTunnel() {
+	if _, statErr := os.Stat(configPath); os.IsNotExist(statErr) {
+		showError("Reversproxy", "config.yaml 파일이 없습니다.\n트레이 메뉴 → 설정을 눌러 설정 후 다시 시도하세요.")
+		updateStatus(stateDisconnected)
+		return
+	}
+	cfg, err := config.LoadClientConfig(configPath)
+	if err != nil {
+		showError("Reversproxy", "설정 파일 오류:\n"+err.Error())
+		updateStatus(stateDisconnected)
+		return
+	}
+
+	ctx, cancel := context.WithCancel(rootCtx)
+	mu.Lock()
+	cancelFn = cancel
+	mu.Unlock()
+
+	status.setConfig(cfg, configPath, logPath)
+	go runTunnelLoop(ctx, cfg)
+}
+
+// stopTunnel cancels the current tunnel context and marks the state disconnected.
+func stopTunnel() {
+	mu.Lock()
+	if cancelFn != nil {
+		cancelFn()
+	}
+	mu.Unlock()
+	updateStatus(stateDisconnected)
+}
+
+// reconnectTunnel tears down the current connection and starts a fresh one.
+// A short delay lets the previous TLS listener release its port before rebinding.
+func reconnectTunnel() {
+	stopTunnel()
+	go func() {
+		time.Sleep(600 * time.Millisecond)
+		startTunnel()
+	}()
+}
+
+// runTunnelLoop starts the TLS listener and the accept loop, updating the tray
+// and live status as the connection state changes. Runs until ctx is cancelled.
+func runTunnelLoop(ctx context.Context, cfg *config.ClientConfig) {
 	log := logger.NewWithLevel("winclient", cfg.LogLevel)
 
 	rcCfg := buildClientConfig(cfg)
@@ -188,7 +230,7 @@ func runTunnelLoop(
 	cert, err := control.LoadOrGenerateCert(cfg.CertPath, cfg.KeyPath)
 	if err != nil {
 		log.Error("failed to load or generate TLS certificate", "err", err)
-		updateStatus(mStatus, mToggle, stateDisconnected)
+		updateStatus(stateDisconnected)
 		return
 	}
 
@@ -204,7 +246,7 @@ func runTunnelLoop(
 	if err != nil {
 		log.Error("failed to start TLS listener", "addr", cfg.ListenAddr, "err", err)
 		showError("Reversproxy 오류", "리스너 시작 실패 ("+cfg.ListenAddr+"):\n"+err.Error())
-		updateStatus(mStatus, mToggle, stateDisconnected)
+		updateStatus(stateDisconnected)
 		return
 	}
 	defer ln.Close()
@@ -224,7 +266,7 @@ func runTunnelLoop(
 		}
 	}
 	if cfg.HTTPProxyAddr != "" {
-		if err := socks.StartHTTPConnectProxy(ctx, cfg.HTTPProxyAddr, sharedWriter, clientMux, log); err != nil {
+		if err := socks.StartHTTPConnectProxy(ctx, cfg.HTTPProxyAddr, sharedWriter, clientMux, log, cfg.HTTPProxyUser, cfg.HTTPProxyPass); err != nil {
 			log.Error("failed to start HTTP CONNECT proxy", "addr", cfg.HTTPProxyAddr, "err", err)
 		}
 	}
@@ -234,7 +276,7 @@ func runTunnelLoop(
 		}
 	}
 
-	updateStatus(mStatus, mToggle, stateConnecting)
+	updateStatus(stateConnecting)
 
 	for {
 		conn, err := ln.Accept()
@@ -244,12 +286,13 @@ func runTunnelLoop(
 			default:
 				log.Error("accept error", "err", err)
 			}
-			updateStatus(mStatus, mToggle, stateDisconnected)
+			updateStatus(stateDisconnected)
 			return
 		}
 
 		log.Info("server connected", "remote", conn.RemoteAddr())
-		updateStatus(mStatus, mToggle, stateConnected)
+		status.setConnected(conn.RemoteAddr().String(), time.Now())
+		updateStatus(stateConnected)
 
 		sharedWriter.SwapConn(conn)
 		clientMux.CloseAll()
@@ -257,33 +300,45 @@ func runTunnelLoop(
 		client.HandleServerConn(ctx, conn, cfg.AuthToken, cfg.Name, rcCfg, sharedWriter, clientMux, log)
 
 		sharedWriter.ClearConn()
-		updateStatus(mStatus, mToggle, stateConnecting)
+		updateStatus(stateConnecting)
 		log.Warn("server connection lost, waiting for reconnect")
 	}
 }
 
-// updateStatus sets the connection state and updates the tray tooltip and menu labels.
-func updateStatus(mStatus *systray.MenuItem, mToggle *systray.MenuItem, state connStateVal) {
+// updateStatus sets the connection state and updates the tray tooltip, menu
+// labels, and the shared live status.
+func updateStatus(state connStateVal) {
 	currentState.Store(int32(state))
+	status.setState(state, "")
+
 	switch state {
 	case stateDisconnected:
-		mStatus.SetTitle("상태: 연결 안됨")
-		mToggle.SetTitle("연결")
-		systray.SetTooltip("Reversproxy — 연결 안됨")
+		setMenu("상태: 연결 안됨", "연결", "Reversproxy — 연결 안됨")
 	case stateConnecting:
-		mStatus.SetTitle("상태: 대기 중 (서버 연결 기다리는 중)")
-		mToggle.SetTitle("연결 해제")
-		systray.SetTooltip("Reversproxy — 서버 연결 대기 중")
+		setMenu("상태: 대기 중 (서버 연결 기다리는 중)", "연결 해제", "Reversproxy — 서버 연결 대기 중")
 	case stateConnected:
-		mStatus.SetTitle("상태: 연결됨")
-		mToggle.SetTitle("연결 해제")
-		systray.SetTooltip("Reversproxy — 연결됨")
+		setMenu("상태: 연결됨", "연결 해제", "Reversproxy — 연결됨")
 	}
+
+	// Refresh the console if it is open.
+	refreshConsole()
 }
 
-// openConfigFile opens configPath with the system default editor on Windows.
-func openConfigFile(configPath string) {
-	_ = exec.Command("cmd", "/c", "start", "", configPath).Start()
+// setMenu updates the tray status/toggle labels and tooltip, tolerating a
+// not-yet-initialised menu (defensive).
+func setMenu(statusTitle, toggleTitle, tooltip string) {
+	if mStatusItem != nil {
+		mStatusItem.SetTitle(statusTitle)
+	}
+	if mToggleItem != nil {
+		mToggleItem.SetTitle(toggleTitle)
+	}
+	systray.SetTooltip(tooltip)
+}
+
+// openConfigFile opens path with the system default editor on Windows.
+func openConfigFile(path string) {
+	_ = exec.Command("cmd", "/c", "start", "", path).Start()
 }
 
 // buildClientConfig converts config.ClientConfig tunnels to reconnect.ClientConfig.
