@@ -159,7 +159,6 @@
 ### 🔧 시스템 설정 파일
 | 파일 | 설명 |
 |------|------|
-| `.claude/agents/vela.md` | Claude AI 에이전트 설정 |
 | `.claude/settings.local.json` | Claude 로컬 설정 |
 | `socat_1.8.0.0-4build3_amd64.deb` | socat 패키지 파일 |
 

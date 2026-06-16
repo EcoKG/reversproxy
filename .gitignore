@@ -4,9 +4,6 @@ dist/
 *.pem
 config.yaml
 
-# Vela Engine (auto-managed)
-.vela/
-
 # ── GSD baseline (auto-generated) ──
 .gsd
 .DS_Store
