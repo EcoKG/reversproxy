@@ -5,11 +5,9 @@ package app
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"log/slog"
 	"net"
-	"os"
 	"sync"
 	"time"
 
@@ -17,6 +15,7 @@ import (
 	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/control"
 	"github.com/EcoKG/reversproxy/internal/logger"
+	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/stats"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
@@ -52,7 +51,7 @@ func NewServerApp(cfg *config.ServerConfig) (*ServerApp, error) {
 		return nil, fmt.Errorf("failed to load or generate TLS certificate: %w", err)
 	}
 
-	clientTLSCfg, err := buildClientTLSConfig(cfg, log)
+	clientTLSCfg, err := control.BuildClientTLSConfig(cfg, log)
 	if err != nil {
 		return nil, fmt.Errorf("failed to build client TLS config: %w", err)
 	}
@@ -83,6 +82,21 @@ func NewServerApp(cfg *config.ServerConfig) (*ServerApp, error) {
 	return app, nil
 }
 
+// Registry returns the client registry, for read-only inspection by a UI.
+func (app *ServerApp) Registry() *control.ClientRegistry { return app.registry }
+
+// Manager returns the tunnel manager, for read-only inspection by a UI.
+func (app *ServerApp) Manager() *tunnel.Manager { return app.manager }
+
+// StatsRegistry returns the per-tunnel stats registry.
+func (app *ServerApp) StatsRegistry() *stats.Registry { return app.statsReg }
+
+// GlobalStats returns the aggregate server stats.
+func (app *ServerApp) GlobalStats() *stats.ServerStats { return app.globalStats }
+
+// Config returns the active server configuration.
+func (app *ServerApp) Config() *config.ServerConfig { return app.config }
+
 // Start starts the server application and blocks until the context is cancelled.
 func (app *ServerApp) Start(ctx context.Context) error {
 	app.log.Info("starting server",
@@ -94,15 +108,16 @@ func (app *ServerApp) Start(ctx context.Context) error {
 		"client_targets", len(app.config.Clients),
 	)
 
-	// Warn if the default insecure token is in use.
-	if app.config.AuthToken == "changeme" {
-		app.log.Warn("SECURITY: auth_token is set to the default value 'changeme' — change it before deploying")
+	// Credential strength is enforced in validateServerConfig (called from
+	// NewServerApp); here we only surface the development-mode posture.
+	if app.config.Insecure {
+		app.log.Warn("SECURITY: running in insecure/development mode — TLS verification is off and default credentials are tolerated; do NOT use in production")
 	}
-	for _, cl := range app.config.Clients {
-		if cl.AuthToken == "changeme" {
-			app.log.Warn("SECURITY: client auth_token is set to the default value 'changeme'",
-				"client", cl.Name)
-		}
+
+	// Apply the SOCKS/HTTP-CONNECT exit-node SSRF egress policy.
+	control.SetAllowPrivateSOCKSTargets(app.config.AllowPrivateTargets)
+	if app.config.AllowPrivateTargets {
+		app.log.Warn("SECURITY: allow_private_targets is enabled — the exit node may dial internal/private addresses (SSRF guard disabled)")
 	}
 
 	// Start data listener
@@ -120,6 +135,8 @@ func (app *ServerApp) Start(ctx context.Context) error {
 			app.config.MaxConcurrent,
 			0,
 		)
+		// Evict idle per-IP entries so the limiter map cannot grow without bound.
+		proxyLimiter.StartCleanup(ctx)
 	}
 
 	// Start HTTP proxy
@@ -271,10 +288,12 @@ func (app *ServerApp) dialClientLoop(
 	}
 }
 
-// broadcastDisconnect sends disconnect message to all connected clients.
+// broadcastDisconnect sends a Disconnect message to all connected clients
+// through each connection's serialising writer.
 func (app *ServerApp) broadcastDisconnect(reason string) {
-	// Implementation moved from main function
-	// This is now testable
+	for _, c := range app.registry.List() {
+		_ = c.Writer.Write(protocol.MsgDisconnect, protocol.Disconnect{Reason: reason})
+	}
 }
 
 // validateServerConfig validates the server configuration.
@@ -304,34 +323,10 @@ func validateServerConfig(cfg *config.ServerConfig) error {
 		}
 	}
 
+	// Fail closed on weak credentials unless development mode is explicit.
+	if err := cfg.ValidateSecurity(); err != nil {
+		return err
+	}
+
 	return nil
-}
-
-// buildClientTLSConfig builds TLS config for outbound client connections.
-// Returns an error if a CA cert is configured but cannot be loaded/parsed.
-func buildClientTLSConfig(cfg *config.ServerConfig, log *slog.Logger) (*tls.Config, error) {
-	tlsCfg := &tls.Config{
-		MinVersion: tls.VersionTLS13,
-	}
-
-	if cfg.Insecure {
-		tlsCfg.InsecureSkipVerify = true //nolint:gosec // intentional: dev mode
-		return tlsCfg, nil
-	}
-
-	if cfg.ClientCACert != "" {
-		caCert, err := os.ReadFile(cfg.ClientCACert)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read client CA cert %q: %w", cfg.ClientCACert, err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("failed to parse client CA cert %q: invalid PEM data", cfg.ClientCACert)
-		}
-		tlsCfg.RootCAs = pool
-		return tlsCfg, nil
-	}
-
-	// No CA cert configured and not insecure — use system root CAs.
-	return tlsCfg, nil
 }

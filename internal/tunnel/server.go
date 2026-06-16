@@ -8,9 +8,9 @@ import (
 	"net"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/protocol"
+	"github.com/google/uuid"
 )
 
 // StartDataListener starts the server-side data connection listener on addr.
@@ -92,13 +92,13 @@ func handleDataConn(conn net.Conn, mgr *Manager, log *slog.Logger) {
 		return
 	}
 
-	if err := mgr.FulfillPending(hello.ConnID, conn); err != nil {
+	if err := mgr.FulfillPending(hello.ConnID, conn, hello.Token); err != nil {
 		log.Warn("data conn: fulfill failed", "connID", hello.ConnID, "err", err)
 		conn.Close()
 		return
 	}
 
-	log.Info("data conn: fulfilled", "connID", hello.ConnID)
+	log.Debug("data conn: fulfilled", "connID", hello.ConnID)
 }
 
 // StartPublicListener opens a TCP listener on the requested public port and
@@ -110,7 +110,7 @@ func handleDataConn(conn net.Conn, mgr *Manager, log *slog.Logger) {
 func StartPublicListener(
 	ctx context.Context,
 	entry *TunnelEntry,
-	clientConn net.Conn,
+	cw *CtrlConnWriter,
 	mgr *Manager,
 	log *slog.Logger,
 ) {
@@ -149,9 +149,11 @@ func StartPublicListener(
 			ConnID:    connID,
 			LocalHost: entry.LocalHost,
 			LocalPort: entry.LocalPort,
+			DataToken: PendingToken(pending),
 		}
-		if err := protocol.WriteMessage(clientConn, protocol.MsgOpenConnection, openMsg); err != nil {
+		if err := cw.Write(protocol.MsgOpenConnection, openMsg); err != nil {
 			log.Warn("failed to send OpenConnection to client", "connID", connID, "err", err)
+			mgr.CancelPending(connID)
 			extConn.Close()
 			continue
 		}
@@ -179,6 +181,12 @@ func relayExternalConn(ctx context.Context, pending *pendingConn, connID string,
 	case <-ctx.Done():
 		log.Warn("context cancelled while waiting for data conn", "connID", connID)
 		mgr.CancelPending(connID)
+		PendingExtConn(pending).Close()
+		return
+	}
+
+	if dataConn == nil {
+		// Pending entry was cancelled concurrently; nothing to relay.
 		PendingExtConn(pending).Close()
 		return
 	}

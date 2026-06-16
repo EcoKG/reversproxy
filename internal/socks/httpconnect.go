@@ -17,7 +17,10 @@ package socks
 import (
 	"bufio"
 	"context"
+	"crypto/subtle"
+	"encoding/base64"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"strconv"
@@ -29,6 +32,11 @@ import (
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
+
+// maxConnectHeaderBytes bounds the request line + headers of an inbound HTTP
+// CONNECT request so a client cannot exhaust memory by streaming bytes without
+// a terminating newline (DoS). The cap is lifted before the relay phase.
+const maxConnectHeaderBytes = 8 * 1024
 
 // LastClientHTTPProxyAddr is the actual bound address after
 // StartHTTPConnectProxy.  Useful when addr uses ":0".
@@ -46,6 +54,7 @@ func StartHTTPConnectProxy(
 	cw ControlWriter,
 	mux *tunnel.SOCKSMux,
 	log *slog.Logger,
+	authUser, authPass string,
 ) error {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
@@ -73,7 +82,7 @@ func StartHTTPConnectProxy(
 				}
 				return
 			}
-			go handleHTTPConnectConn(ctx, conn, cw, mux, log)
+			go handleHTTPConnectConn(ctx, conn, cw, mux, log, authUser, authPass)
 		}
 	}()
 
@@ -87,12 +96,16 @@ func handleHTTPConnectConn(
 	cw ControlWriter,
 	mux *tunnel.SOCKSMux,
 	log *slog.Logger,
+	authUser, authPass string,
 ) {
 	defer conn.Close()
 
 	_ = conn.SetDeadline(time.Now().Add(30 * time.Second))
 
-	br := bufio.NewReader(conn)
+	// Bound the handshake (request line + headers) so a client cannot exhaust
+	// memory by never sending a newline (F26). lr.N is lifted before relaying.
+	lr := &io.LimitedReader{R: conn, N: maxConnectHeaderBytes}
+	br := bufio.NewReader(lr)
 
 	// ------------------------------------------------------------------ //
 	// Phase 1 — Read request line: METHOD target HTTP/1.x
@@ -100,6 +113,9 @@ func handleHTTPConnectConn(
 
 	requestLine, err := br.ReadString('\n')
 	if err != nil {
+		if lr.N <= 0 {
+			writeHTTPError(conn, "431 Request Header Fields Too Large")
+		}
 		log.Debug("http connect proxy: failed to read request line", "err", err)
 		return
 	}
@@ -115,19 +131,45 @@ func handleHTTPConnectConn(
 	target := parts[1]
 
 	// ------------------------------------------------------------------ //
-	// Phase 2 — Consume remaining headers (read until blank line)
+	// Phase 2 — Consume remaining headers (read until blank line), capturing
+	// Proxy-Authorization for the optional auth gate.
 	// ------------------------------------------------------------------ //
 
+	var proxyAuth string
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil {
+			if lr.N <= 0 {
+				writeHTTPError(conn, "431 Request Header Fields Too Large")
+			}
 			return
 		}
 		line = strings.TrimRight(line, "\r\n")
 		if line == "" {
 			break
 		}
+		if k, v, ok := strings.Cut(line, ":"); ok && strings.EqualFold(strings.TrimSpace(k), "Proxy-Authorization") {
+			proxyAuth = strings.TrimSpace(v)
+		}
 	}
+
+	// ------------------------------------------------------------------ //
+	// Phase 2.5 — Enforce proxy authentication when configured.
+	// ------------------------------------------------------------------ //
+
+	if authUser != "" || authPass != "" {
+		if !checkProxyBasicAuth(proxyAuth, authUser, authPass) {
+			resp := "HTTP/1.1 407 Proxy Authentication Required\r\n" +
+				"Proxy-Authenticate: Basic realm=\"reversproxy\"\r\n" +
+				"Content-Length: 0\r\nConnection: close\r\n\r\n"
+			_, _ = conn.Write([]byte(resp))
+			log.Warn("http connect proxy: missing/invalid proxy credentials", "remote", conn.RemoteAddr())
+			return
+		}
+	}
+
+	// Handshake parsed; lift the header cap so the tunneled stream is unbounded.
+	lr.N = 1 << 62
 
 	// ------------------------------------------------------------------ //
 	// Phase 3 — Handle non-CONNECT methods with a human-readable response
@@ -239,6 +281,21 @@ func handleHTTPConnectConn(
 
 	mux.Remove(connID)
 	log.Info("http connect proxy: relay finished", "connID", connID)
+}
+
+// checkProxyBasicAuth validates an HTTP Basic "Proxy-Authorization" header
+// value against the configured user/pass using a constant-time comparison.
+func checkProxyBasicAuth(header, user, pass string) bool {
+	const prefix = "Basic "
+	if len(header) <= len(prefix) || !strings.EqualFold(header[:len(prefix)], prefix) {
+		return false
+	}
+	raw, err := base64.StdEncoding.DecodeString(strings.TrimSpace(header[len(prefix):]))
+	if err != nil {
+		return false
+	}
+	want := user + ":" + pass
+	return subtle.ConstantTimeCompare(raw, []byte(want)) == 1
 }
 
 // writeHTTPError sends a minimal HTTP error response and ignores write errors.

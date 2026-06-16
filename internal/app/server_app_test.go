@@ -8,8 +8,16 @@ import (
 	"github.com/EcoKG/reversproxy/internal/config"
 )
 
-func TestServerApp_New(t *testing.T) {
+// validTestServerConfig returns a default server config with a non-default
+// auth token so it passes the fail-closed security validation.
+func validTestServerConfig() *config.ServerConfig {
 	cfg := config.DefaultServerConfig()
+	cfg.AuthToken = "test-token-not-default"
+	return cfg
+}
+
+func TestServerApp_New(t *testing.T) {
+	cfg := validTestServerConfig()
 
 	app, err := NewServerApp(cfg)
 	if err != nil {
@@ -26,7 +34,7 @@ func TestServerApp_New(t *testing.T) {
 }
 
 func TestServerApp_Start_Stop(t *testing.T) {
-	cfg := config.DefaultServerConfig()
+	cfg := validTestServerConfig()
 	// Use random ports to avoid conflicts
 	cfg.DataAddr = ":0"
 	cfg.HTTPAddr = ":0"
@@ -72,8 +80,13 @@ func TestServerApp_ConfigValidation(t *testing.T) {
 	}{
 		{
 			name:    "valid config",
-			config:  config.DefaultServerConfig(),
+			config:  validTestServerConfig(),
 			wantErr: false,
+		},
+		{
+			name:    "default (empty) token rejected in secure mode",
+			config:  config.DefaultServerConfig(),
+			wantErr: true,
 		},
 		{
 			name:    "nil config",

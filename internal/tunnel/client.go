@@ -145,9 +145,11 @@ func handleOpenConnAsync(msg protocol.OpenConnection, serverDataAddr string, log
 		_ = tc.SetKeepAlivePeriod(15 * time.Second)
 	}
 
-	// 2. Send DataConnHello.
+	// 2. Send DataConnHello, echoing the single-use token so the server can
+	// verify we are the legitimate owner of this connID.
 	if err := protocol.WriteMessage(dataConn, protocol.MsgDataConnHello, protocol.DataConnHello{
 		ConnID: msg.ConnID,
+		Token:  msg.DataToken,
 	}); err != nil {
 		return fmt.Errorf("write DataConnHello: %w", err)
 	}

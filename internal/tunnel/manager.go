@@ -1,6 +1,9 @@
 package tunnel
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"sync"
@@ -9,19 +12,15 @@ import (
 // pendingConn holds the external user's net.Conn while waiting for the client
 // to dial back with a matching data connection.
 type pendingConn struct {
-	extConn  net.Conn
-	ready    chan struct{} // closed when dataConn is filled
-	dataConn net.Conn
-}
-
-// pendingSOCKS holds state for an in-progress SOCKS5 CONNECT request.
-// The server creates one of these while waiting for the client to dial the
-// target and report back via MsgSOCKSReady.
-type pendingSOCKS struct {
-	// ready is closed (by FulfillSOCKS) once the client has reported the dial result.
-	ready   chan struct{}
-	success bool
-	errMsg  string
+	extConn   net.Conn
+	ready     chan struct{} // closed (exactly once) when the wait resolves
+	dataConn  net.Conn
+	closeOnce sync.Once // guards close(ready) so Fulfill/Cancel cannot double-close
+	// dataToken is a per-connection single-use secret sent to the legitimate
+	// client (over the authenticated control channel) inside OpenConnection. The
+	// client must echo it in DataConnHello, so knowledge of the public connID
+	// alone is insufficient to fulfil (hijack) a pending data connection.
+	dataToken string
 }
 
 // TunnelEntry describes a single registered tunnel.
@@ -54,7 +53,6 @@ type Manager struct {
 	tunnels       map[string]*TunnelEntry     // tunnelID → entry
 	byClient      map[string][]string         // clientID → []tunnelID
 	pending       map[string]*pendingConn     // connID → pendingConn
-	pendingSocks  map[string]*pendingSOCKS    // connID → pendingSOCKS
 	httpTunnels   map[string]*HTTPTunnelEntry // hostname → HTTPTunnelEntry (plain HTTP)
 	httpsTunnels  map[string]*HTTPTunnelEntry // hostname → HTTPTunnelEntry (HTTPS/SNI)
 	httpByClient  map[string][]string         // clientID → []hostname (HTTP)
@@ -67,7 +65,6 @@ func NewManager() *Manager {
 		tunnels:       make(map[string]*TunnelEntry),
 		byClient:      make(map[string][]string),
 		pending:       make(map[string]*pendingConn),
-		pendingSocks:  make(map[string]*pendingSOCKS),
 		httpTunnels:   make(map[string]*HTTPTunnelEntry),
 		httpsTunnels:  make(map[string]*HTTPTunnelEntry),
 		httpByClient:  make(map[string][]string),
@@ -121,11 +118,13 @@ func (m *Manager) RemoveTunnelsForClient(clientID string) {
 }
 
 // RegisterPending stores an external connection under connID and returns the
-// pendingConn so the caller can wait for the data connection.
+// pendingConn so the caller can wait for the data connection. A single-use data
+// token is generated and must be echoed by the client in DataConnHello.
 func (m *Manager) RegisterPending(connID string, extConn net.Conn) *pendingConn {
 	p := &pendingConn{
-		extConn: extConn,
-		ready:   make(chan struct{}),
+		extConn:   extConn,
+		ready:     make(chan struct{}),
+		dataToken: newDataToken(),
 	}
 	m.mu.Lock()
 	m.pending[connID] = p
@@ -133,35 +132,67 @@ func (m *Manager) RegisterPending(connID string, extConn net.Conn) *pendingConn 
 	return p
 }
 
-// CancelPending removes a pending connection entry without fulfilling it.
-// This cleans up the map entry when the external conn is closed before the
-// client dials back (e.g. context cancelled, timeout).
-func (m *Manager) CancelPending(connID string) {
-	m.mu.Lock()
-	delete(m.pending, connID)
-	m.mu.Unlock()
+// newDataToken returns a 256-bit cryptographically-random hex token. On the
+// (practically impossible) failure of crypto/rand it returns "" — FulfillPending
+// then rejects all data conns for that pending entry (fail closed).
+func newDataToken() string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b[:])
 }
 
-// FulfillPending matches a client data connection to the waiting external
-// connection identified by connID. Returns an error if connID is unknown.
-func (m *Manager) FulfillPending(connID string, dataConn net.Conn) error {
+// PendingToken returns the single-use data token for a pendingConn. Callers
+// place it in the OpenConnection message sent to the owning client.
+func PendingToken(p *pendingConn) string {
+	return p.dataToken
+}
+
+// CancelPending removes a pending connection entry without fulfilling it and
+// closes its ready channel so any goroutine parked in WaitReady unblocks
+// (returning a nil dataConn). This cleans up the map entry AND the waiter when
+// the external conn is closed before the client dials back (e.g. context
+// cancelled, timeout, OpenConnection send failure).
+func (m *Manager) CancelPending(connID string) {
 	m.mu.Lock()
 	p, ok := m.pending[connID]
 	if ok {
 		delete(m.pending, connID)
 	}
 	m.mu.Unlock()
+	if ok {
+		p.closeOnce.Do(func() { close(p.ready) })
+	}
+}
 
+// FulfillPending matches a client data connection to the waiting external
+// connection identified by connID. The presented token must match the
+// single-use token issued at RegisterPending (constant-time), otherwise the
+// data conn is rejected WITHOUT consuming the pending entry — so a wrong guess
+// cannot cancel the legitimate fulfilment. Returns an error if connID is
+// unknown or the token is invalid.
+func (m *Manager) FulfillPending(connID string, dataConn net.Conn, token string) error {
+	m.mu.Lock()
+	p, ok := m.pending[connID]
 	if !ok {
+		m.mu.Unlock()
 		return fmt.Errorf("tunnel manager: unknown connID %q", connID)
 	}
+	if p.dataToken == "" || subtle.ConstantTimeCompare([]byte(p.dataToken), []byte(token)) != 1 {
+		m.mu.Unlock()
+		return fmt.Errorf("tunnel manager: invalid data token for connID %q", connID)
+	}
+	delete(m.pending, connID)
+	m.mu.Unlock()
 
 	p.dataConn = dataConn
-	close(p.ready)
+	p.closeOnce.Do(func() { close(p.ready) })
 	return nil
 }
 
-// WaitReady blocks until the pendingConn's data connection arrives.
+// WaitReady blocks until the pendingConn's data connection arrives, or until
+// the pending entry is cancelled (in which case it returns nil).
 func WaitReady(p *pendingConn) net.Conn {
 	<-p.ready
 	return p.dataConn
@@ -296,43 +327,4 @@ func (m *Manager) RemoveHTTPTunnelsForClient(clientID string) {
 		delete(m.httpsTunnels, h)
 	}
 	delete(m.httpsByClient, clientID)
-}
-
-// RegisterPendingSOCKS stores a pending SOCKS5 connection under connID and
-// returns the pendingSOCKS so the caller can wait for the client's result.
-func (m *Manager) RegisterPendingSOCKS(connID string) *pendingSOCKS {
-	p := &pendingSOCKS{
-		ready: make(chan struct{}),
-	}
-	m.mu.Lock()
-	m.pendingSocks[connID] = p
-	m.mu.Unlock()
-	return p
-}
-
-// FulfillSOCKS records the result of a client's dial attempt for a SOCKS5
-// connection. Returns an error if connID is unknown.
-func (m *Manager) FulfillSOCKS(connID string, success bool, errMsg string) error {
-	m.mu.Lock()
-	p, ok := m.pendingSocks[connID]
-	if ok {
-		delete(m.pendingSocks, connID)
-	}
-	m.mu.Unlock()
-
-	if !ok {
-		return fmt.Errorf("tunnel manager: unknown SOCKS connID %q", connID)
-	}
-
-	p.success = success
-	p.errMsg = errMsg
-	close(p.ready)
-	return nil
-}
-
-// WaitSOCKSReady blocks until the client reports the result of the dial.
-// Returns (true, "") on success or (false, errMsg) on failure.
-func WaitSOCKSReady(p *pendingSOCKS) (bool, string) {
-	<-p.ready
-	return p.success, p.errMsg
 }

@@ -5,6 +5,8 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"sync"
+	"time"
 
 	"github.com/EcoKG/reversproxy/internal/protocol"
 )
@@ -45,6 +47,38 @@ func RelayMuxChannel(
 	// outSend carries payloads from the local reader to the mux writer.
 	outSend := make(chan []byte, 64)
 	muxWriterDone := make(chan struct{})
+	recvDone := make(chan struct{})
+
+	// relayCtx derives from the parent so that control-conn teardown (parent
+	// cancellation) breaks an in-flight relay, and so internal failure paths can
+	// trigger the same teardown.
+	relayCtx, relayCancel := context.WithCancel(ctx)
+	defer relayCancel()
+
+	// closeLocal force-unblocks goroutine A (blocked in r.Read) and goroutine B
+	// (blocked reading the peer pipe) by tearing down the local conn and the
+	// recv pipe. Idempotent.
+	var closeOnce sync.Once
+	closeLocal := func() {
+		closeOnce.Do(func() {
+			_ = w.SetReadDeadline(time.Now().Add(-time.Second))
+			_ = w.Close()
+			ch.CloseRecv() // EOF the peer pipe so goroutine B unblocks
+		})
+	}
+
+	// Watcher: when the peer half-closes (recvDone) OR the relay is cancelled
+	// (parent ctx done, or an internal failure path), force the local side
+	// closed. Without this, a peer-close-first or a control-write failure leaves
+	// goroutine A blocked on r.Read forever and the caller's deferred conn.Close
+	// never runs (F04 / F18).
+	go func() {
+		select {
+		case <-recvDone:
+		case <-relayCtx.Done():
+		}
+		closeLocal()
+	}()
 
 	// Goroutine A: local reader → peer via MsgSOCKSData.
 	// Reads raw bytes from r; pushes slices into outSend.
@@ -57,7 +91,11 @@ func RelayMuxChannel(
 			if n > 0 {
 				payload := make([]byte, n)
 				copy(payload, buf[:n])
-				outSend <- payload
+				select {
+				case outSend <- payload:
+				case <-relayCtx.Done():
+					return
+				}
 			}
 			if err != nil {
 				return
@@ -67,8 +105,7 @@ func RelayMuxChannel(
 
 	// Goroutine B: mux channel → local writer (MsgSOCKSData from peer).
 	// Reads from ch.Recv; writes to w.
-	// Exits when ch.Recv returns EOF (pipe closed by mux.Remove / DeliverClose).
-	recvDone := make(chan struct{})
+	// Exits when ch.Recv returns EOF (pipe closed by mux teardown / closeLocal).
 	go func() {
 		defer close(recvDone)
 		_, _ = io.Copy(w, ch.Recv)
@@ -83,7 +120,11 @@ func RelayMuxChannel(
 				ConnID:  connID,
 				Payload: payload,
 			}); err != nil {
-				// Drain outSend to unblock goroutine A.
+				// Control-plane write failed: tear down so goroutine A stops
+				// producing (closeLocal closes the local conn → r.Read errors →
+				// outSend is closed), then drain to completion. Without the
+				// cancel, A could keep producing forever while we drain (F18).
+				relayCancel()
 				for range outSend {
 				}
 				return

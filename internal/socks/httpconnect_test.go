@@ -88,7 +88,7 @@ func newHTTPProxyTestEnv(t *testing.T, ctx context.Context) (proxyAddr string, c
 
 	// Start the HTTP CONNECT proxy using clientSide as the control writer.
 	cw := &pipeControlWriter{conn: clientSide}
-	if err := socks.StartHTTPConnectProxy(ctx, "127.0.0.1:0", cw, clientMux, log); err != nil {
+	if err := socks.StartHTTPConnectProxy(ctx, "127.0.0.1:0", cw, clientMux, log, "", ""); err != nil {
 		serverSide.Close()
 		clientSide.Close()
 		t.Fatalf("StartHTTPConnectProxy: %v", err)

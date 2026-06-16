@@ -10,8 +10,9 @@ import (
 	"strings"
 	"time"
 
-	"github.com/google/uuid"
+	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/protocol"
+	"github.com/google/uuid"
 )
 
 // LastHTTPSAddr is set by StartHTTPSProxy to the actual bound address (useful
@@ -130,7 +131,7 @@ func handleHTTPSConn(
 		return
 	}
 
-	clientConn, ok := ctrlConns.Get(entry.ClientID)
+	clientWriter, ok := ctrlConns.Get(entry.ClientID)
 	if !ok {
 		log.Warn("HTTPS proxy: client not connected", "sni", host, "clientID", entry.ClientID)
 		extConn.Close()
@@ -152,19 +153,23 @@ func handleHTTPSConn(
 		ConnID:    connID,
 		LocalHost: entry.LocalHost,
 		LocalPort: entry.LocalPort,
+		DataToken: PendingToken(pending),
 	}
-	if err := protocol.WriteMessage(clientConn, protocol.MsgOpenConnection, openMsg); err != nil {
+	if err := clientWriter.Write(protocol.MsgOpenConnection, openMsg); err != nil {
 		log.Warn("HTTPS proxy: failed to send OpenConnection", "connID", connID, "err", err)
+		mgr.CancelPending(connID)
 		extConn.Close()
 		return
 	}
 
-	go relayHTTPSConn(ctx, pending, connID, peeked, log)
+	// Relay synchronously so a configured concurrency Limiter's Release fires at
+	// relay end (see http_proxy.go). handleHTTPSConn always runs in its own goroutine.
+	relayHTTPSConn(ctx, pending, connID, mgr, peeked, log)
 }
 
 // relayHTTPSConn waits for the client data connection, replays the peeked
 // TLS bytes, then relays bidirectionally at the raw TCP level.
-func relayHTTPSConn(ctx context.Context, pending *pendingConn, connID string, peeked []byte, log *slog.Logger) {
+func relayHTTPSConn(ctx context.Context, pending *pendingConn, connID string, mgr *Manager, peeked []byte, log *slog.Logger) {
 	waitDone := make(chan net.Conn, 1)
 	go func() {
 		waitDone <- WaitReady(pending)
@@ -173,11 +178,19 @@ func relayHTTPSConn(ctx context.Context, pending *pendingConn, connID string, pe
 	var dataConn net.Conn
 	select {
 	case dataConn = <-waitDone:
-	case <-time.After(15 * time.Second):
+	case <-time.After(config.DataConnWaitTimeout):
 		log.Warn("HTTPS proxy: timeout waiting for data conn", "connID", connID)
+		mgr.CancelPending(connID)
 		PendingExtConn(pending).Close()
 		return
 	case <-ctx.Done():
+		mgr.CancelPending(connID)
+		PendingExtConn(pending).Close()
+		return
+	}
+
+	if dataConn == nil {
+		// Pending entry was cancelled concurrently; nothing to relay.
 		PendingExtConn(pending).Close()
 		return
 	}

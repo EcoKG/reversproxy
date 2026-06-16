@@ -5,6 +5,7 @@ import (
 	"crypto/tls"
 	"flag"
 	"fmt"
+	"net"
 	"os/signal"
 	"syscall"
 
@@ -21,25 +22,25 @@ func main() {
 	// ------------------------------------------------------------------ //
 	// Flags — config file is loaded first; flags override.
 	// ------------------------------------------------------------------ //
-	configFile := flag.String("config",      "config.yaml",  "path to YAML config file (optional)")
-	listenAddr := flag.String("listen",      "",             "listen address for server connections (overrides config)")
-	token      := flag.String("token",       "",             "pre-shared auth token (overrides config)")
-	name       := flag.String("name",        "",             "client label (overrides config)")
-	insecure   := flag.Bool("insecure",      false,          "skip TLS certificate verification (overrides config)")
-	localHost  := flag.String("local-host",  "127.0.0.1",    "local service hostname to tunnel")
-	localPort  := flag.Int("local-port",     0,              "local service port to tunnel (0 = no tunnel)")
-	pubPort    := flag.Int("pub-port",       0,              "requested public port on server (0 = any)")
-	httpHost   := flag.String("http-host",   "",             "hostname to register for HTTP host-based routing")
-	httpPort   := flag.Int("http-port",      0,              "local port for HTTP routing")
-	httpsHost  := flag.String("https-host",  "",             "hostname to register for HTTPS SNI routing")
-	httpsPort  := flag.Int("https-port",     0,              "local port for HTTPS routing")
-	socksAddr     := flag.String("socks-addr",       "",             "local SOCKS5 listener address (overrides config; empty = use config default)")
-	socksUser     := flag.String("socks-user",       "",             "SOCKS5 auth username (overrides config; empty = no auth)")
-	socksPass     := flag.String("socks-pass",       "",             "SOCKS5 auth password (overrides config; empty = no auth)")
-	httpProxyAddr := flag.String("http-proxy-addr",  "",             "local HTTP CONNECT proxy address (overrides config; empty = use config default)")
-	logLevel   := flag.String("log-level",   "",             "log level: debug/info/warn/error (overrides config)")
-	certFile   := flag.String("cert",        "",             "TLS certificate file path (overrides config)")
-	keyFile    := flag.String("key",         "",             "TLS private key file path (overrides config)")
+	configFile := flag.String("config", "config.yaml", "path to YAML config file (optional)")
+	listenAddr := flag.String("listen", "", "listen address for server connections (overrides config)")
+	token := flag.String("token", "", "pre-shared auth token (overrides config)")
+	name := flag.String("name", "", "client label (overrides config)")
+	insecure := flag.Bool("insecure", false, "skip TLS certificate verification (overrides config)")
+	localHost := flag.String("local-host", "127.0.0.1", "local service hostname to tunnel")
+	localPort := flag.Int("local-port", 0, "local service port to tunnel (0 = no tunnel)")
+	pubPort := flag.Int("pub-port", 0, "requested public port on server (0 = any)")
+	httpHost := flag.String("http-host", "", "hostname to register for HTTP host-based routing")
+	httpPort := flag.Int("http-port", 0, "local port for HTTP routing")
+	httpsHost := flag.String("https-host", "", "hostname to register for HTTPS SNI routing")
+	httpsPort := flag.Int("https-port", 0, "local port for HTTPS routing")
+	socksAddr := flag.String("socks-addr", "", "local SOCKS5 listener address (overrides config; empty = use config default)")
+	socksUser := flag.String("socks-user", "", "SOCKS5 auth username (overrides config; empty = no auth)")
+	socksPass := flag.String("socks-pass", "", "SOCKS5 auth password (overrides config; empty = no auth)")
+	httpProxyAddr := flag.String("http-proxy-addr", "", "local HTTP CONNECT proxy address (overrides config; empty = use config default)")
+	logLevel := flag.String("log-level", "", "log level: debug/info/warn/error (overrides config)")
+	certFile := flag.String("cert", "", "TLS certificate file path (overrides config)")
+	keyFile := flag.String("key", "", "TLS private key file path (overrides config)")
 	flag.Parse()
 
 	// ------------------------------------------------------------------ //
@@ -81,8 +82,13 @@ func main() {
 
 	log := logger.NewWithLevel("client", cfg.LogLevel)
 
-	if cfg.AuthToken == "changeme" {
-		log.Warn("security: default AuthToken 'changeme' is in use — change it for production")
+	// Fail closed on a missing/default token unless development mode is explicit.
+	if err := cfg.ValidateSecurity(); err != nil {
+		log.Error("SECURITY: refusing to start", "err", err)
+		return
+	}
+	if cfg.Insecure {
+		log.Warn("SECURITY: running in insecure/development mode — TLS verification is off and default credentials are tolerated; do NOT use in production")
 	}
 
 	// ------------------------------------------------------------------ //
@@ -168,6 +174,10 @@ func main() {
 	clientMux := tunnel.NewSOCKSMux()
 
 	if cfg.SOCKSAddr != "" {
+		if isNonLoopbackBind(cfg.SOCKSAddr) && cfg.SOCKSUser == "" && cfg.SOCKSPass == "" {
+			log.Warn("SECURITY: SOCKS5 proxy is bound to a non-loopback address without authentication — it is an open relay; set socks_user/socks_pass or bind to 127.0.0.1",
+				"addr", cfg.SOCKSAddr)
+		}
 		if err := socks.StartClientSOCKSProxy(ctx, cfg.SOCKSAddr, sharedWriter, clientMux, log, cfg.SOCKSUser, cfg.SOCKSPass); err != nil {
 			log.Error("failed to start client SOCKS5 proxy", "addr", cfg.SOCKSAddr, "err", err)
 		} else {
@@ -176,7 +186,11 @@ func main() {
 	}
 
 	if cfg.HTTPProxyAddr != "" {
-		if err := socks.StartHTTPConnectProxy(ctx, cfg.HTTPProxyAddr, sharedWriter, clientMux, log); err != nil {
+		if isNonLoopbackBind(cfg.HTTPProxyAddr) && cfg.HTTPProxyUser == "" && cfg.HTTPProxyPass == "" {
+			log.Warn("SECURITY: HTTP CONNECT proxy is bound to a non-loopback address without authentication — it is an open relay; set http_proxy_user/http_proxy_pass or bind to 127.0.0.1",
+				"addr", cfg.HTTPProxyAddr)
+		}
+		if err := socks.StartHTTPConnectProxy(ctx, cfg.HTTPProxyAddr, sharedWriter, clientMux, log, cfg.HTTPProxyUser, cfg.HTTPProxyPass); err != nil {
 			log.Error("failed to start HTTP CONNECT proxy", "addr", cfg.HTTPProxyAddr, "err", err)
 		} else {
 			fmt.Printf("HTTP CONNECT proxy: http://%s (use HTTPS_PROXY)\n", socks.LastClientHTTPProxyAddr)
@@ -222,4 +236,21 @@ func main() {
 		sharedWriter.ClearConn()
 		log.Warn("server connection lost, waiting for reconnect")
 	}
+}
+
+// isNonLoopbackBind reports whether addr binds to an interface other than
+// loopback, i.e. an unauthenticated listener there would be reachable off-host.
+func isNonLoopbackBind(addr string) bool {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return false
+	}
+	if host == "" || host == "0.0.0.0" || host == "::" {
+		return true // wildcard bind reaches all interfaces
+	}
+	ip := net.ParseIP(host)
+	if ip == nil {
+		return false // a hostname — cannot classify, do not warn
+	}
+	return !ip.IsLoopback()
 }

@@ -5,6 +5,7 @@ package client
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/gob"
 	"fmt"
 	"log/slog"
@@ -102,7 +103,8 @@ func HandleServerConn(
 		return
 	}
 
-	if msg.AuthToken != authToken {
+	// Constant-time comparison to avoid leaking the token via response timing.
+	if subtle.ConstantTimeCompare([]byte(msg.AuthToken), []byte(authToken)) != 1 {
 		_ = protocol.WriteMessage(conn, protocol.MsgRegisterResp, protocol.RegisterResp{
 			Status: "error",
 			Error:  "invalid token",

@@ -5,15 +5,23 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
-	"github.com/google/uuid"
 	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/protocol"
+	"github.com/google/uuid"
 )
+
+// maxHTTPHeaderBytes bounds the request line + headers of an inbound proxied
+// HTTP request so a client cannot exhaust memory by streaming header bytes
+// (http.ReadRequest applies no limit of its own). The relay phase reads the
+// connection directly and is unaffected.
+const maxHTTPHeaderBytes = 64 * 1024
 
 // LastHTTPAddr is set by StartHTTPProxy to the actual bound address (useful
 // when addr is ":0" and the OS picks a port).
@@ -107,22 +115,30 @@ func handleHTTPConn(
 	// Set a deadline for reading the initial HTTP request.
 	_ = extConn.SetDeadline(time.Now().Add(config.ProxyReadTimeout))
 
-	// Use a bufio reader so we can peek without consuming bytes.
-	br := bufio.NewReader(extConn)
+	// Bound the header read; the relay phase reads extConn directly so it is
+	// unaffected by this cap.
+	lr := &io.LimitedReader{R: extConn, N: maxHTTPHeaderBytes}
+	br := bufio.NewReader(lr)
 
 	req, err := http.ReadRequest(br)
 	if err != nil {
+		code, msg := http.StatusBadRequest, "Bad Request"
+		if lr.N <= 0 {
+			code, msg = http.StatusRequestHeaderFieldsTooLarge, "Request Header Fields Too Large"
+		}
 		log.Warn("HTTP proxy: failed to read request", "err", err, "remote", extConn.RemoteAddr())
-		writeHTTPError(extConn, http.StatusBadRequest, "Bad Request")
+		writeHTTPError(extConn, code, msg)
 		extConn.Close()
 		return
 	}
 
-	// Extract hostname (strip port if present).
+	// Extract hostname (strip port if present) and normalise to lower case so it
+	// matches the lowercased key stored at registration.
 	host := req.Host
 	if h, _, err2 := net.SplitHostPort(host); err2 == nil {
 		host = h
 	}
+	host = strings.ToLower(host)
 
 	if host == "" {
 		writeHTTPError(extConn, http.StatusBadRequest, "Missing Host header")
@@ -141,8 +157,8 @@ func handleHTTPConn(
 		return
 	}
 
-	// Look up the client's control connection.
-	clientConn, ok := ctrlConns.Get(entry.ClientID)
+	// Look up the client's control-connection writer (serialised).
+	clientWriter, ok := ctrlConns.Get(entry.ClientID)
 	if !ok {
 		log.Warn("HTTP proxy: client not connected", "host", host, "clientID", entry.ClientID)
 		writeHTTPError(extConn, http.StatusBadGateway, "Client tunnel not available")
@@ -186,20 +202,25 @@ func handleHTTPConn(
 		ConnID:    connID,
 		LocalHost: entry.LocalHost,
 		LocalPort: entry.LocalPort,
+		DataToken: PendingToken(pending),
 	}
-	if err := protocol.WriteMessage(clientConn, protocol.MsgOpenConnection, openMsg); err != nil {
+	if err := clientWriter.Write(protocol.MsgOpenConnection, openMsg); err != nil {
 		log.Warn("HTTP proxy: failed to send OpenConnection", "connID", connID, "err", err)
+		mgr.CancelPending(connID)
 		extConn.Close()
 		return
 	}
 
-	// Relay in a goroutine; replay the raw HTTP request bytes first.
-	go relayHTTPConn(ctx, pending, connID, rawReqBuf.Bytes(), log)
+	// Relay synchronously so that, when a concurrency Limiter is configured, the
+	// accept loop's deferred rl.Release() fires only after the relay finishes
+	// (not at hand-off) — keeping the in-flight count accurate. handleHTTPConn is
+	// always invoked in its own goroutine, so blocking here is safe.
+	relayHTTPConn(ctx, pending, connID, mgr, rawReqBuf.Bytes(), log)
 }
 
 // relayHTTPConn waits for the client's data connection, replays the raw HTTP
 // request bytes, then relays bidirectionally.
-func relayHTTPConn(ctx context.Context, pending *pendingConn, connID string, rawReq []byte, log *slog.Logger) {
+func relayHTTPConn(ctx context.Context, pending *pendingConn, connID string, mgr *Manager, rawReq []byte, log *slog.Logger) {
 	waitDone := make(chan net.Conn, 1)
 	go func() {
 		waitDone <- WaitReady(pending)
@@ -210,9 +231,17 @@ func relayHTTPConn(ctx context.Context, pending *pendingConn, connID string, raw
 	case dataConn = <-waitDone:
 	case <-time.After(config.DataConnWaitTimeout):
 		log.Warn("HTTP proxy: timeout waiting for data conn", "connID", connID)
+		mgr.CancelPending(connID)
 		PendingExtConn(pending).Close()
 		return
 	case <-ctx.Done():
+		mgr.CancelPending(connID)
+		PendingExtConn(pending).Close()
+		return
+	}
+
+	if dataConn == nil {
+		// Pending entry was cancelled concurrently; nothing to relay.
 		PendingExtConn(pending).Close()
 		return
 	}
@@ -237,21 +266,37 @@ func relayHTTPConn(ctx context.Context, pending *pendingConn, connID string, raw
 	log.Info("HTTP proxy: relay finished", "connID", connID)
 }
 
-// sourceHeaders lists headers that could reveal the original client's
-// identity or network path. All are removed before forwarding through the tunnel.
+// sourceHeaders lists headers that could reveal the original client's identity
+// or network path, or that are proxy hop-by-hop headers. All are removed before
+// forwarding through the tunnel so the backend sees only the proxy.
 var sourceHeaders = []string{
 	"X-Forwarded-For",
-	"X-Real-Ip",
-	"X-Client-Ip",
-	"Client-Ip",
-	"Forwarded",
-	"Via",
+	"X-Forwarded",
 	"X-Forwarded-Host",
 	"X-Forwarded-Proto",
 	"X-Forwarded-Port",
+	"X-Forwarded-Server",
+	"X-Original-Forwarded-For",
+	"Forwarded",
+	"Via",
+	"X-Real-Ip",
+	"X-Client-Ip",
+	"Client-Ip",
+	"X-Cluster-Client-Ip",
 	"X-Originating-Ip",
-	"Cf-Connecting-Ip",
+	"X-Proxyuser-Ip",
+	"Proxy-Client-Ip",
+	"Wl-Proxy-Client-Ip",
 	"True-Client-Ip",
+	"Cf-Connecting-Ip",
+	"Cf-Connecting-Ipv6",
+	"Cf-Ipcountry",
+	"Cf-Ray",
+	"Fastly-Client-Ip",
+	"Fastly-Ssl",
+	// Proxy hop-by-hop headers that must not be forwarded.
+	"Proxy-Authorization",
+	"Proxy-Connection",
 }
 
 // stripSourceHeaders removes all headers that could reveal the original
@@ -270,4 +315,3 @@ func writeHTTPError(conn net.Conn, code int, msg string) {
 		code, http.StatusText(code), len(body), body)
 	_, _ = conn.Write([]byte(resp))
 }
-

@@ -17,8 +17,9 @@ func TestLoadServerConfig_MissingFile(t *testing.T) {
 	if cfg.DataAddr != ":8444" {
 		t.Errorf("DataAddr: got %q, want %q", cfg.DataAddr, ":8444")
 	}
-	if cfg.AuthToken != "changeme" {
-		t.Errorf("AuthToken: got %q, want %q", cfg.AuthToken, "changeme")
+	// Secure default: no hardcoded credential — the operator must supply a token.
+	if cfg.AuthToken != "" {
+		t.Errorf("AuthToken default: got %q, want empty", cfg.AuthToken)
 	}
 }
 

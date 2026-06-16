@@ -3,9 +3,7 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"flag"
-	"fmt"
 	"log/slog"
 	"net"
 	"os"
@@ -30,15 +28,15 @@ func main() {
 	// ------------------------------------------------------------------ //
 	// Note: SOCKS5 is now a CLIENT-side feature.  The server acts as the exit
 	// node and no longer needs its own SOCKS5 listener flags.
-	configFile := flag.String("config",      "config.yaml", "path to YAML config file (optional)")
-	dataAddr   := flag.String("data-addr",   "",            "TCP data connection listen address (overrides config)")
-	httpAddr   := flag.String("http-addr",   "",            "HTTP host-based proxy listen address (overrides config)")
-	httpsAddr  := flag.String("https-addr",  "",            "HTTPS SNI-routing proxy listen address (overrides config)")
-	adminAddr  := flag.String("admin-addr",  "",            "Admin HTTP API listen address (overrides config)")
-	token      := flag.String("token",       "",            "default pre-shared auth token (overrides config)")
-	certFile   := flag.String("cert",        "",            "TLS certificate file path (overrides config)")
-	keyFile    := flag.String("key",         "",            "TLS private key file path (overrides config)")
-	logLevel   := flag.String("log-level",   "",            "log level: debug/info/warn/error (overrides config)")
+	configFile := flag.String("config", "config.yaml", "path to YAML config file (optional)")
+	dataAddr := flag.String("data-addr", "", "TCP data connection listen address (overrides config)")
+	httpAddr := flag.String("http-addr", "", "HTTP host-based proxy listen address (overrides config)")
+	httpsAddr := flag.String("https-addr", "", "HTTPS SNI-routing proxy listen address (overrides config)")
+	adminAddr := flag.String("admin-addr", "", "Admin HTTP API listen address (overrides config)")
+	token := flag.String("token", "", "default pre-shared auth token (overrides config)")
+	certFile := flag.String("cert", "", "TLS certificate file path (overrides config)")
+	keyFile := flag.String("key", "", "TLS private key file path (overrides config)")
+	logLevel := flag.String("log-level", "", "log level: debug/info/warn/error (overrides config)")
 	flag.Parse()
 
 	// ------------------------------------------------------------------ //
@@ -79,24 +77,28 @@ func main() {
 	log := logger.NewWithLevel("server", cfg.LogLevel)
 
 	log.Info("server configuration loaded",
-		"data_addr",     cfg.DataAddr,
-		"http_addr",     cfg.HTTPAddr,
-		"https_addr",    cfg.HTTPSAddr,
-		"admin_addr",    cfg.AdminAddr,
-		"log_level",     cfg.LogLevel,
+		"data_addr", cfg.DataAddr,
+		"http_addr", cfg.HTTPAddr,
+		"https_addr", cfg.HTTPSAddr,
+		"admin_addr", cfg.AdminAddr,
+		"log_level", cfg.LogLevel,
 		"client_targets", len(cfg.Clients),
-		"note",          "SOCKS5 listener is now on the CLIENT side",
+		"note", "SOCKS5 listener is now on the CLIENT side",
 	)
 
-	// Warn if the default insecure token is in use.
-	if cfg.AuthToken == "changeme" {
-		log.Warn("SECURITY: auth_token is set to the default value 'changeme' — change it before deploying")
+	// Fail closed on a missing/default token unless development mode is explicit.
+	if err := cfg.ValidateSecurity(); err != nil {
+		log.Error("SECURITY: refusing to start", "err", err)
+		os.Exit(1)
 	}
-	for _, cl := range cfg.Clients {
-		if cl.AuthToken == "changeme" {
-			log.Warn("SECURITY: client auth_token is set to the default value 'changeme'",
-				"client", cl.Name)
-		}
+	if cfg.Insecure {
+		log.Warn("SECURITY: running in insecure/development mode — TLS verification is off and default credentials are tolerated; do NOT use in production")
+	}
+
+	// Apply the SOCKS/HTTP-CONNECT exit-node SSRF egress policy.
+	control.SetAllowPrivateSOCKSTargets(cfg.AllowPrivateTargets)
+	if cfg.AllowPrivateTargets {
+		log.Warn("SECURITY: allow_private_targets is enabled — the exit node may dial internal/private addresses (SSRF guard disabled)")
 	}
 
 	// ------------------------------------------------------------------ //
@@ -112,10 +114,10 @@ func main() {
 	// ------------------------------------------------------------------ //
 	// Registry, tunnel manager, stats, and root context
 	// ------------------------------------------------------------------ //
-	reg       := control.NewClientRegistry()
-	mgr       := tunnel.NewManager()
+	reg := control.NewClientRegistry()
+	mgr := tunnel.NewManager()
 	ctrlConns := tunnel.NewControlConnRegistry()
-	statsReg  := stats.NewRegistry()
+	statsReg := stats.NewRegistry()
 	globalStats := stats.Global
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -132,6 +134,8 @@ func main() {
 	var proxyLimiter *tunnel.Limiter
 	if cfg.MaxConnRate > 0 || cfg.MaxConcurrent > 0 {
 		proxyLimiter = tunnel.NewLimiter(cfg.MaxConnRate, cfg.MaxConnBurst, cfg.MaxConcurrent, 0)
+		// Evict idle per-IP entries so the limiter map cannot grow without bound.
+		proxyLimiter.StartCleanup(ctx)
 	}
 
 	// Start the HTTP host-based proxy.
@@ -186,7 +190,7 @@ func main() {
 	}
 
 	// Build TLS config for dialing clients.
-	clientTLSCfg, err := buildClientTLSConfig(cfg, log)
+	clientTLSCfg, err := control.BuildClientTLSConfig(cfg, log)
 	if err != nil {
 		log.Error("failed to build client TLS config", "err", err)
 		os.Exit(1)
@@ -217,9 +221,10 @@ func main() {
 	// Cancel root context — propagates to all client goroutines.
 	cancel()
 
-	// Broadcast Disconnect to every connected client.
+	// Broadcast Disconnect to every connected client through the serialising
+	// writer so it cannot interleave with an in-flight heartbeat/proxy write.
 	for _, c := range reg.List() {
-		_ = protocol.WriteMessage(c.Conn, protocol.MsgDisconnect, protocol.Disconnect{
+		_ = c.Writer.Write(protocol.MsgDisconnect, protocol.Disconnect{
 			Reason: "server shutdown",
 		})
 	}
@@ -318,34 +323,4 @@ func dialClientLoop(
 		// Reset backoff when we successfully reconnect (on next successful HandleControlConn).
 		backoff.Reset()
 	}
-}
-
-// buildClientTLSConfig builds a *tls.Config for the server's outbound
-// connections to clients based on the ServerConfig settings.
-// Returns an error if a CA cert is configured but cannot be loaded/parsed.
-func buildClientTLSConfig(cfg *config.ServerConfig, log *slog.Logger) (*tls.Config, error) {
-	tlsCfg := &tls.Config{
-		MinVersion: tls.VersionTLS13,
-	}
-
-	if cfg.Insecure {
-		tlsCfg.InsecureSkipVerify = true //nolint:gosec // intentional: dev mode
-		return tlsCfg, nil
-	}
-
-	if cfg.ClientCACert != "" {
-		caCert, err := os.ReadFile(cfg.ClientCACert)
-		if err != nil {
-			return nil, fmt.Errorf("failed to read client CA cert %q: %w", cfg.ClientCACert, err)
-		}
-		pool := x509.NewCertPool()
-		if !pool.AppendCertsFromPEM(caCert) {
-			return nil, fmt.Errorf("failed to parse client CA cert %q: invalid PEM data", cfg.ClientCACert)
-		}
-		tlsCfg.RootCAs = pool
-		return tlsCfg, nil
-	}
-
-	// No CA cert configured and not insecure — use system root CAs.
-	return tlsCfg, nil
 }

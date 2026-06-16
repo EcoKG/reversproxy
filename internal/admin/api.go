@@ -48,10 +48,10 @@ type TunnelInfo struct {
 
 // StatsInfo is the JSON representation of the aggregate traffic statistics.
 type StatsInfo struct {
-	TotalConnections  int64                        `json:"total_connections"`
-	ActiveConnections int64                        `json:"active_connections"`
-	BytesIn           int64                        `json:"bytes_in"`
-	BytesOut          int64                        `json:"bytes_out"`
+	TotalConnections  int64                           `json:"total_connections"`
+	ActiveConnections int64                           `json:"active_connections"`
+	BytesIn           int64                           `json:"bytes_in"`
+	BytesOut          int64                           `json:"bytes_out"`
 	Tunnels           map[string]stats.TunnelSnapshot `json:"tunnels,omitempty"`
 }
 
@@ -107,10 +107,12 @@ func (s *Server) authMiddleware(next http.HandlerFunc) http.HandlerFunc {
 		}
 		auth := r.Header.Get("Authorization")
 		if auth == "" || !strings.HasPrefix(auth, "Bearer ") {
+			s.log.Warn("admin: unauthorized request (missing/malformed bearer)", "remote", r.RemoteAddr, "path", r.URL.Path)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
 		if subtle.ConstantTimeCompare([]byte(strings.TrimPrefix(auth, "Bearer ")), []byte(s.token)) != 1 {
+			s.log.Warn("admin: unauthorized request (bad token)", "remote", r.RemoteAddr, "path", r.URL.Path)
 			http.Error(w, "unauthorized", http.StatusUnauthorized)
 			return
 		}
@@ -124,6 +126,29 @@ func (s *Server) Start(ctx context.Context, addr string) error {
 	// Default to localhost-only when no host is specified.
 	if strings.HasPrefix(addr, ":") {
 		addr = "127.0.0.1" + addr
+	}
+
+	// Classify the bind target. A string-prefix heuristic is not enough — parse
+	// the host and check it is genuinely loopback (F09).
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("admin: invalid addr %q: %w", addr, err)
+	}
+	ip := net.ParseIP(host)
+	isLoopback := host == "localhost" || (ip != nil && ip.IsLoopback())
+
+	// Fail closed: an unauthenticated admin API exposed beyond loopback would let
+	// anyone on the network read topology and control state (F08/F09). Refuse to
+	// expose it; keep the rest of the server running.
+	if s.token == "" && !isLoopback {
+		s.log.Error("SECURITY: admin API NOT started — refusing to bind a non-loopback address without admin_token; set admin_token or bind to loopback", "addr", addr)
+		return nil
+	}
+	if s.token == "" {
+		s.log.Warn("SECURITY: admin API has NO authentication (admin_token is empty); anyone able to reach its address can read client/tunnel topology — set admin_token", "addr", addr)
+	}
+	if !isLoopback {
+		s.log.Warn("SECURITY: admin API is bound beyond loopback", "addr", addr)
 	}
 
 	ln, err := net.Listen("tcp", addr)

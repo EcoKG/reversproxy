@@ -96,7 +96,7 @@ func TestStartHeartbeat_SendsPing(t *testing.T) {
 // TestStartHeartbeat_PongTimeout verifies that StartHeartbeat cancels the
 // client context after maxMissed unanswered pings and the timeout window.
 func TestStartHeartbeat_PongTimeout(t *testing.T) {
-	client, serverConn, clientConn, cancelFn := newPipeClient(t)
+	_, serverConn, clientConn, cancelFn := newPipeClient(t)
 	_ = cancelFn
 
 	// Track whether our cancelFn gets called by wrapping it.
@@ -177,7 +177,7 @@ func TestStartHeartbeat_ContextCancel(t *testing.T) {
 // fact that a pong-responding peer does NOT trigger context cancellation
 // within 2×HeartbeatInterval.
 func TestStartHeartbeat_PongReceived(t *testing.T) {
-	client, _, clientConn, cancelFn := newPipeClient(t)
+	_, _, clientConn, cancelFn := newPipeClient(t)
 
 	cancelCalled := make(chan struct{}, 1)
 	// Replace client's cancel with one that signals cancelCalled.
