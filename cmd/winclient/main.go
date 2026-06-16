@@ -10,6 +10,7 @@ import (
 	"crypto/tls"
 	_ "embed"
 	"log/slog"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,6 +21,7 @@ import (
 	"github.com/EcoKG/reversproxy/internal/client"
 	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/control"
+	"github.com/EcoKG/reversproxy/internal/filetransfer"
 	"github.com/EcoKG/reversproxy/internal/logger"
 	"github.com/EcoKG/reversproxy/internal/reconnect"
 	"github.com/EcoKG/reversproxy/internal/socks"
@@ -49,6 +51,9 @@ var (
 )
 
 func main() {
+	// Handle CLI-style subcommands (send-file / register-menu / unregister-menu)
+	// before launching the tray; each exits the process when matched.
+	dispatchWinSubcommands()
 	systray.Run(onReady, onExit)
 }
 
@@ -63,6 +68,10 @@ func onReady() {
 	systray.AddSeparator()
 	mToggle := systray.AddMenuItem("연결", "서버에 연결/해제")
 	mConfig := systray.AddMenuItem("설정 파일 열기", "config.yaml 편집")
+	mDrop := systray.AddMenuItem("수신함 열기", "받은 파일 폴더 열기")
+	systray.AddSeparator()
+	mReg := systray.AddMenuItem("우클릭 메뉴 등록", "탐색기 우클릭에 '파일 전송' 추가")
+	mUnreg := systray.AddMenuItem("우클릭 메뉴 해제", "탐색기 우클릭 메뉴 제거")
 	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("종료", "프로그램 종료")
 
@@ -92,6 +101,42 @@ func onReady() {
 	cancelFn = rootCancel
 	mu.Unlock()
 
+	// ---- File-transfer feature: drop-folder receiver + right-click sender ----
+	// Lives for the whole tray lifetime (rootCtx), independent of tunnel toggles.
+	notify := func(msg string, ok bool) {
+		if ok {
+			systray.SetTooltip("Reversproxy — " + msg)
+		} else {
+			showError("Reversproxy 파일전송", msg)
+		}
+	}
+	var dropDirAbs string
+	if ftCfg, ferr := config.LoadClientConfig(configPath); ferr == nil && ftCfg.FileTransfer.Enabled {
+		ft := ftCfg.FileTransfer
+		dropDirAbs = ft.DropDir
+		if dropDirAbs != "" && !filepath.IsAbs(dropDirAbs) {
+			dropDirAbs = filepath.Join(exeDir, dropDirAbs)
+		}
+		if recv, rerr := filetransfer.NewReceiver(dropDirAbs, ft.Token, ft.MaxFileSize, log); rerr != nil {
+			log.Error("file transfer: receiver init failed", "err", rerr)
+		} else {
+			recv.OnComplete(func(p string, _ int64) { notify("파일 도착: "+filepath.Base(p), true) })
+			if addr, serr := filetransfer.StartReceiver(rootCtx, ft.ReceiveAddr, recv); serr != nil {
+				log.Error("file transfer: receiver start failed", "err", serr)
+			} else {
+				dropDirAbs = recv.Dir()
+				log.Info("file transfer receiver listening", "addr", addr, "drop_dir", dropDirAbs)
+			}
+		}
+		if ft.ControlAddr != "" {
+			if cerr := startControlServer(rootCtx, ft.ControlAddr, ft.SendEndpoint, ft.Token, log, notify); cerr != nil {
+				log.Error("file transfer: control server failed", "err", cerr)
+			} else {
+				log.Info("file transfer control server listening", "addr", ft.ControlAddr)
+			}
+		}
+	}
+
 	// Auto-connect on startup: check file existence first, then load.
 	if _, statErr := os.Stat(configPath); os.IsNotExist(statErr) {
 		const tmpl = "listen_addr: \":8443\"\nauth_token: \"changeme\"\nname: \"my-pc\"\nlog_level: \"info\"\ninsecure: false\ntunnels: []\n"
@@ -110,6 +155,10 @@ func onReady() {
 			mu.Lock()
 			cancelFn = cancel
 			mu.Unlock()
+			// Publish "connecting" before spawning so the menu loop's
+			// check-then-act on currentState can't mistake an in-progress
+			// startup for "disconnected" (see toggle branch below).
+			updateStatus(mStatus, mToggle, stateConnecting)
 			go runTunnelLoop(ctx, cfg, mStatus, mToggle)
 		} else {
 			log.Error("config.yaml 로드 실패", "err", err)
@@ -140,6 +189,13 @@ func onReady() {
 				mu.Lock()
 				cancelFn = cancel
 				mu.Unlock()
+				// Publish "connecting" synchronously on the menu goroutine BEFORE
+				// spawning the loop. runTunnelLoop only sets it after cert+listen,
+				// so without this a rapid second click would still read
+				// stateDisconnected, re-enter this branch, overwrite cancelFn
+				// (losing the first run's cancel) and start a duplicate run that
+				// orphans the first TLS listener until process exit.
+				updateStatus(mStatus, mToggle, stateConnecting)
 				go runTunnelLoop(ctx, reloadedCfg, mStatus, mToggle)
 			} else {
 				// Disconnect.
@@ -153,6 +209,19 @@ func onReady() {
 
 		case <-mConfig.ClickedCh:
 			openConfigFile(configPath)
+
+		case <-mDrop.ClickedCh:
+			if dropDirAbs != "" {
+				openFolder(dropDirAbs)
+			} else {
+				showError("Reversproxy", "수신함이 설정되지 않았습니다.\nconfig.yaml에서 file_transfer.enabled 와 drop_dir 를 설정하세요.")
+			}
+
+		case <-mReg.ClickedCh:
+			registerContextMenu()
+
+		case <-mUnreg.ClickedCh:
+			unregisterContextMenu()
 
 		case <-mQuit.ClickedCh:
 			mu.Lock()
@@ -215,27 +284,32 @@ func runTunnelLoop(
 		_ = ln.Close()
 	}()
 
-	sharedWriter := &client.ConnWriter{}
-	clientMux := tunnel.NewSOCKSMux()
+	// Server pool — multi-server support, mirroring cmd/client. Each connected
+	// proxy server is an independent session with its own writer and SOCKS mux.
+	// Client-originated SOCKS5 / HTTP CONNECT / port-forward requests pick a
+	// session round-robin; external traffic flows through its own session.
+	pool := client.NewServerPool()
 
 	if cfg.SOCKSAddr != "" {
-		if err := socks.StartClientSOCKSProxy(ctx, cfg.SOCKSAddr, sharedWriter, clientMux, log, cfg.SOCKSUser, cfg.SOCKSPass); err != nil {
+		if err := socks.StartClientSOCKSProxy(ctx, cfg.SOCKSAddr, pool, log, cfg.SOCKSUser, cfg.SOCKSPass); err != nil {
 			log.Error("failed to start SOCKS5 proxy", "addr", cfg.SOCKSAddr, "err", err)
 		}
 	}
 	if cfg.HTTPProxyAddr != "" {
-		if err := socks.StartHTTPConnectProxy(ctx, cfg.HTTPProxyAddr, sharedWriter, clientMux, log); err != nil {
+		if err := socks.StartHTTPConnectProxy(ctx, cfg.HTTPProxyAddr, pool, log); err != nil {
 			log.Error("failed to start HTTP CONNECT proxy", "addr", cfg.HTTPProxyAddr, "err", err)
 		}
 	}
 	for _, pf := range cfg.PortForwards {
-		if err := socks.StartPortForward(ctx, pf.LocalPort, pf.RemoteHost, pf.RemotePort, pf.Bind, sharedWriter, clientMux, log); err != nil {
+		if err := socks.StartPortForward(ctx, pf.LocalPort, pf.RemoteHost, pf.RemotePort, pf.Bind, pool, log); err != nil {
 			log.Error("failed to start port forward", "localPort", pf.LocalPort, "err", err)
 		}
 	}
 
 	updateStatus(mStatus, mToggle, stateConnecting)
 
+	// Accept loop — each inbound server connection is handled in its own
+	// goroutine so multiple servers can connect concurrently.
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -247,18 +321,45 @@ func runTunnelLoop(
 			updateStatus(mStatus, mToggle, stateDisconnected)
 			return
 		}
+		go handleServerSession(ctx, conn, cfg, rcCfg, pool, log, mStatus, mToggle)
+	}
+}
 
-		log.Info("server connected", "remote", conn.RemoteAddr())
-		updateStatus(mStatus, mToggle, stateConnected)
+// handleServerSession wraps one inbound server connection in a ServerSession,
+// adds it to the pool for the duration of the handshake + message loop, and
+// removes it on exit. Tray status follows the pool's active-session count:
+// the first connection flips the tray to "connected"; when the last session
+// drops (and we are still running) the tray returns to "waiting for reconnect".
+func handleServerSession(
+	ctx context.Context,
+	conn net.Conn,
+	cfg *config.ClientConfig,
+	rcCfg *reconnect.ClientConfig,
+	pool *client.ServerPool,
+	log *slog.Logger,
+	mStatus *systray.MenuItem,
+	mToggle *systray.MenuItem,
+) {
+	session := &client.ServerSession{
+		ID:          conn.RemoteAddr().String(),
+		Conn:        conn,
+		Writer:      client.NewConnWriter(conn),
+		Mux:         tunnel.NewSOCKSMux(),
+		Addr:        conn.RemoteAddr().String(),
+		ConnectedAt: time.Now(),
+	}
 
-		sharedWriter.SwapConn(conn)
-		clientMux.CloseAll()
+	pool.Add(session)
+	updateStatus(mStatus, mToggle, stateConnected)
+	log.Info("server connected", "remote", session.Addr, "active_servers", pool.Len())
 
-		client.HandleServerConn(ctx, conn, cfg.AuthToken, cfg.Name, rcCfg, sharedWriter, clientMux, log)
+	client.HandleServerConn(ctx, session, cfg.AuthToken, cfg.Name, rcCfg, log)
 
-		sharedWriter.ClearConn()
+	pool.Remove(session)
+	remaining := pool.Len()
+	log.Warn("server connection lost", "remote", session.Addr, "active_servers", remaining)
+	if remaining == 0 && ctx.Err() == nil {
 		updateStatus(mStatus, mToggle, stateConnecting)
-		log.Warn("server connection lost, waiting for reconnect")
 	}
 }
 

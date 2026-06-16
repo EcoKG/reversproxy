@@ -12,9 +12,9 @@ var (
 	messageBoxW = user32.NewProc("MessageBoxW")
 )
 
-// showError displays a Windows error dialog box.
-// Safe to call before systray is initialized.
-func showError(title, msg string) {
+// messageBox displays a Windows dialog with the given icon flag (uType).
+// Safe to call before systray is initialized and from any goroutine.
+func messageBox(title, msg string, uType uintptr) {
 	t, err1 := syscall.UTF16PtrFromString(title)
 	m, err2 := syscall.UTF16PtrFromString(msg)
 	if err1 != nil || err2 != nil {
@@ -25,6 +25,12 @@ func showError(title, msg string) {
 		0,
 		uintptr(unsafe.Pointer(m)),
 		uintptr(unsafe.Pointer(t)),
-		0x10, // MB_ICONERROR
+		uType,
 	)
 }
+
+// showError displays a Windows error dialog box.
+func showError(title, msg string) { messageBox(title, msg, 0x10) } // MB_ICONERROR
+
+// showInfo displays a Windows information dialog box.
+func showInfo(title, msg string) { messageBox(title, msg, 0x40) } // MB_ICONINFORMATION

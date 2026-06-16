@@ -14,6 +14,7 @@ import (
 	"github.com/EcoKG/reversproxy/internal/client"
 	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/control"
+	"github.com/EcoKG/reversproxy/internal/filetransfer"
 	"github.com/EcoKG/reversproxy/internal/logger"
 	"github.com/EcoKG/reversproxy/internal/reconnect"
 	"github.com/EcoKG/reversproxy/internal/socks"
@@ -21,6 +22,9 @@ import (
 )
 
 func main() {
+	// Handle non-flag subcommands (e.g. "send") before normal flag parsing.
+	dispatchSubcommands()
+
 	// ------------------------------------------------------------------ //
 	// Flags — config file is loaded first; flags override.
 	// ------------------------------------------------------------------ //
@@ -193,6 +197,19 @@ func main() {
 			log.Error("failed to start port forward", "localPort", pf.LocalPort, "err", err)
 		} else {
 			fmt.Printf("Port forward: localhost:%d → %s:%d\n", pf.LocalPort, pf.RemoteHost, pf.RemotePort)
+		}
+	}
+
+	// File-transfer receiver (drop folder). The receive endpoint is meant to be
+	// exposed to the peer through a tunnel so the peer can drop files here.
+	if cfg.FileTransfer.Enabled {
+		if recv, ferr := filetransfer.NewReceiver(cfg.FileTransfer.DropDir, cfg.FileTransfer.Token, cfg.FileTransfer.MaxFileSize, log); ferr != nil {
+			log.Error("file transfer: receiver init failed", "err", ferr)
+		} else if ftAddr, serr := filetransfer.StartReceiver(ctx, cfg.FileTransfer.ReceiveAddr, recv); serr != nil {
+			log.Error("file transfer: receiver start failed", "addr", cfg.FileTransfer.ReceiveAddr, "err", serr)
+		} else {
+			log.Info("file transfer receiver listening", "addr", ftAddr, "drop_dir", recv.Dir())
+			fmt.Printf("File transfer receiver: %s (drop: %s)\n", ftAddr, recv.Dir())
 		}
 	}
 
