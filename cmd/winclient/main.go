@@ -51,22 +51,24 @@ var (
 	logPath    string
 )
 
-// cancelFn holds the current tunnel context canceller; reconnectFn performs a
-// disconnect+reconnect (wired in onReady, invoked by the console). Protected by mu.
+// cancelFn holds the current tunnel context canceller. Protected by mu.
 var (
-	mu          sync.Mutex
-	cancelFn    context.CancelFunc
-	reconnectFn func()
+	mu       sync.Mutex
+	cancelFn context.CancelFunc
 )
 
-// reconnectTunnel disconnects and re-establishes the tunnel. Invoked from the
-// management console's "재연결" button.
+// reconnectReqCh carries reconnect requests from the management console to the
+// single menu-event goroutine, so reconnect is serialised with the tray toggle
+// (eliminates the concurrent-runTunnelLoop / orphaned-listener race).
+var reconnectReqCh = make(chan struct{}, 1)
+
+// reconnectTunnel requests a disconnect+reconnect. It may be invoked from the
+// management console (a different goroutine); the actual work runs on the menu
+// goroutine via reconnectReqCh, so it never races the toggle handler.
 func reconnectTunnel() {
-	mu.Lock()
-	fn := reconnectFn
-	mu.Unlock()
-	if fn != nil {
-		go fn()
+	select {
+	case reconnectReqCh <- struct{}{}:
+	default: // a reconnect is already queued
 	}
 }
 
@@ -162,30 +164,7 @@ func onReady() {
 		}
 	}
 
-	// Wire reconnect (used by the management console) and seed the status
-	// snapshot for the console/settings views.
-	reconnectFn = func() {
-		mu.Lock()
-		if cancelFn != nil {
-			cancelFn()
-		}
-		mu.Unlock()
-		updateStatus(mStatus, mToggle, stateDisconnected)
-		time.Sleep(500 * time.Millisecond)
-		if _, statErr := os.Stat(configPath); statErr != nil {
-			return
-		}
-		rcfg, lerr := config.LoadClientConfig(configPath)
-		if lerr != nil {
-			return
-		}
-		ctx, cancel := context.WithCancel(rootCtx)
-		mu.Lock()
-		cancelFn = cancel
-		mu.Unlock()
-		updateStatus(mStatus, mToggle, stateConnecting)
-		go runTunnelLoop(ctx, rcfg, mStatus, mToggle)
-	}
+	// Seed the status snapshot for the console/settings views.
 	if scfg, serr := config.LoadClientConfig(configPath); serr == nil {
 		status.setConfig(scfg, configPath, logPath)
 	} else {
@@ -286,6 +265,32 @@ func onReady() {
 
 		case <-mReconnect.ClickedCh:
 			reconnectTunnel()
+
+		case <-reconnectReqCh:
+			// Reconnect runs here on the single menu goroutine, so it cannot race
+			// the toggle handler (no duplicate runTunnelLoop / orphaned listener).
+			mu.Lock()
+			if cancelFn != nil {
+				cancelFn()
+			}
+			mu.Unlock()
+			updateStatus(mStatus, mToggle, stateConnecting)
+			time.Sleep(500 * time.Millisecond) // let the old TLS listener release its port
+			if _, statErr := os.Stat(configPath); statErr != nil {
+				updateStatus(mStatus, mToggle, stateDisconnected)
+				continue
+			}
+			rcfg, lerr := config.LoadClientConfig(configPath)
+			if lerr != nil {
+				showError("Reversproxy", "설정 파일 오류:\n"+lerr.Error())
+				updateStatus(mStatus, mToggle, stateDisconnected)
+				continue
+			}
+			rctx, rcancel := context.WithCancel(rootCtx)
+			mu.Lock()
+			cancelFn = rcancel
+			mu.Unlock()
+			go runTunnelLoop(rctx, rcfg, mStatus, mToggle)
 
 		case <-mAutostart.ClickedCh:
 			enable := !mAutostart.Checked()
@@ -425,6 +430,9 @@ func handleServerSession(
 
 	pool.Add(session)
 	updateStatus(mStatus, mToggle, stateConnected)
+	// Record the connected server + timestamp so the management console shows
+	// the peer address and elapsed connection time.
+	status.setConnected(session.Addr, session.ConnectedAt)
 	log.Info("server connected", "remote", session.Addr, "active_servers", pool.Len())
 
 	client.HandleServerConn(ctx, session, cfg.AuthToken, cfg.Name, rcCfg, log)

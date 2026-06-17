@@ -18,6 +18,7 @@ import (
 	"github.com/EcoKG/reversproxy/internal/control"
 	"github.com/EcoKG/reversproxy/internal/filetransfer"
 	"github.com/EcoKG/reversproxy/internal/logger"
+	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/stats"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
@@ -43,6 +44,12 @@ func NewServerApp(cfg *config.ServerConfig) (*ServerApp, error) {
 
 	if err := validateServerConfig(cfg); err != nil {
 		return nil, fmt.Errorf("invalid config: %w", err)
+	}
+
+	// Fail closed on weak credentials (empty/"changeme" token) unless the
+	// operator explicitly enabled insecure (development) mode.
+	if err := cfg.ValidateSecurity(); err != nil {
+		return nil, fmt.Errorf("insecure configuration: %w", err)
 	}
 
 	log := logger.NewWithLevel("server", cfg.LogLevel)
@@ -303,10 +310,14 @@ func (app *ServerApp) dialClientLoop(
 	}
 }
 
-// broadcastDisconnect sends disconnect message to all connected clients.
+// broadcastDisconnect sends a Disconnect message to every connected client via
+// its serialising writer so they can close cleanly on server shutdown.
 func (app *ServerApp) broadcastDisconnect(reason string) {
-	// Implementation moved from main function
-	// This is now testable
+	for _, c := range app.registry.List() {
+		if c.Writer != nil {
+			_ = c.Writer.Write(protocol.MsgDisconnect, protocol.Disconnect{Reason: reason})
+		}
+	}
 }
 
 // validateServerConfig validates the server configuration.

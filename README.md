@@ -130,18 +130,20 @@
 
 ## 설치
 
-릴리스 워크플로(GitHub Actions)는 태그 푸시(`v*`) 시 다음 6종 아티팩트를 크로스 컴파일해 릴리스에 업로드합니다(모두 **순수 Go, CGO 불필요**).
+릴리스 워크플로(GitHub Actions)는 태그 푸시(`v*`) 시 다음 7종 아티팩트를 크로스 컴파일해 릴리스에 업로드합니다(모두 **순수 Go, CGO 불필요**).
 
 | 아티팩트 | 대상 | 비고 |
 |----------|------|------|
 | `reversproxy-client-linux-amd64` | Linux 클라이언트 (x86_64) | CLI |
 | `reversproxy-client-linux-arm64` | Linux 클라이언트 (arm64) | CLI |
-| `reversproxy-client-windows-amd64.exe` | Windows 클라이언트 | GUI 시스템 트레이 |
+| `reversproxy-client-windows-amd64.exe` | Windows 클라이언트 | GUI 시스템 트레이 (관리 콘솔·설정·우클릭 파일전송) |
 | `reversproxy-server-linux-amd64` | Linux 서버 (x86_64) | CLI |
 | `reversproxy-server-linux-arm64` | Linux 서버 (arm64) | CLI |
 | `reversproxy-server-windows-amd64.exe` | Windows 서버 | CLI |
+| `reversproxy-winserver-windows-amd64.exe` | Windows 서버 | GUI 시스템 트레이 + 네이티브 관리 콘솔 (`cmd/winserver`) |
 
-> 클라이언트 형태: **리눅스 = CLI(`cmd/client`), 윈도우 = GUI 시스템 트레이(`cmd/winclient`)**. 서버는 양쪽 모두 CLI입니다. 윈도우 GUI 클라이언트는 드롭 폴더 수신 + 탐색기 우클릭 파일 전송을 지원합니다([FILE_TRANSFER.md](FILE_TRANSFER.md)).
+> 클라이언트: **리눅스 = CLI(`cmd/client`), 윈도우 = 네이티브 GUI 트레이(`cmd/winclient`)** — 관리 콘솔(lxn/walk)·설정 창·드롭 폴더 수신·탐색기 우클릭 파일전송([FILE_TRANSFER.md](FILE_TRANSFER.md)).
+> 서버: CLI(`cmd/server`, 양 OS)와 **윈도우 네이티브 GUI 서버(`cmd/winserver`)** 둘 다 제공. GUI 서버는 트레이 + 네이티브 관리 콘솔(접속 클라이언트·터널·트래픽)로 풀기능 서버(웹 대시보드·파일전송 포함)를 사용자 세션에서 실행합니다([docs/winserver-deploy.md](docs/winserver-deploy.md)).
 
 ### Linux 클라이언트 (원라이너)
 
@@ -602,7 +604,8 @@ make run-client    # go run ./cmd/client -listen :8443 -token changeme -name cli
 cmd/
   client/        CLI 클라이언트 진입점 (tls.Listen, ServerPool, 출구 프런트엔드 기동)
   server/        서버 진입점 (dialClientLoop, tofuCheck, 공개 리스너, 관리 서버)
-  winclient/     Windows 시스템 트레이 GUI 클라이언트 (//go:build windows, 순수 Go) — 우클릭 파일전송 통합(shellext.go)
+  winclient/     Windows 네이티브 GUI 클라이언트 (//go:build windows) — systray + lxn/walk 관리콘솔/설정, 우클릭 파일전송(shellext.go)
+  winserver/     Windows 네이티브 GUI 서버 (//go:build windows) — systray + lxn/walk 관리콘솔, internal/app.Start로 풀기능 서버 구동
 internal/
   config/        YAML 설정 로딩 (KnownFields 엄격), 기본값, 컴파일 타임 상수
   filetransfer/  재개·SHA-256 검증 가능한 파일 전송(수신기/송신기) — 우클릭/CLI 전송의 코어

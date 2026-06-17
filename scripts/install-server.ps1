@@ -53,6 +53,12 @@ cert_path: "server.crt"
 key_path: "server.key"
 log_level: "info"
 
+# 자체 서명 인증서로 클라이언트를 다이얼하므로 insecure: true 가 필요합니다.
+# 운영에서는 강력한 auth_token 으로 바꾸고, tls_fingerprint 또는 client_ca_cert
+# 로 클라이언트 인증서를 검증한 뒤 insecure 를 false 로 두시기 바랍니다.
+# (insecure: false + 약한/기본 토큰이면 서버가 기동을 거부합니다 — fail-closed)
+insecure: true
+
 # List of clients to connect to
 clients:
   - name: "client1"
