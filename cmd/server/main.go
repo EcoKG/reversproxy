@@ -79,6 +79,9 @@ func main() {
 	// ------------------------------------------------------------------ //
 	log := logger.NewWithLevel("server", cfg.LogLevel)
 
+	// Apply the SSRF egress policy before any control connection is handled.
+	control.SetAllowPrivateSOCKSTargets(cfg.AllowPrivateTargets)
+
 	log.Info("server configuration loaded",
 		"data_addr",     cfg.DataAddr,
 		"http_addr",     cfg.HTTPAddr,

@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net"
+	"syscall"
 	"time"
 
 	"github.com/google/uuid"
@@ -16,6 +17,46 @@ import (
 	"github.com/EcoKG/reversproxy/internal/protocol"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
+
+// allowPrivateSOCKSTargets, when true, disables the SSRF egress guard so the
+// exit node may dial loopback/private/link-local addresses. Configured once at
+// startup via SetAllowPrivateSOCKSTargets.
+var allowPrivateSOCKSTargets bool
+
+// SetAllowPrivateSOCKSTargets configures the exit-node SSRF policy. Call once at
+// startup before any control connection is handled.
+func SetAllowPrivateSOCKSTargets(allow bool) { allowPrivateSOCKSTargets = allow }
+
+// isBlockedTargetIP reports whether ip is in a range the exit node must refuse
+// to reach (SSRF guard): loopback, private (RFC1918/RFC4193 ULA), link-local,
+// unspecified, or multicast — including the cloud metadata range 169.254/16.
+func isBlockedTargetIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified() || ip.IsMulticast()
+}
+
+// newSOCKSDialer returns a dialer whose Control hook enforces the SSRF guard on
+// the post-resolution address, so a hostname that resolves to an internal IP is
+// still blocked.
+func newSOCKSDialer(timeout time.Duration) *net.Dialer {
+	return &net.Dialer{
+		Timeout: timeout,
+		Control: func(_, address string, _ syscall.RawConn) error {
+			if allowPrivateSOCKSTargets {
+				return nil
+			}
+			host, _, err := net.SplitHostPort(address)
+			if err != nil {
+				return err
+			}
+			ip := net.ParseIP(host)
+			if ip == nil || isBlockedTargetIP(ip) {
+				return fmt.Errorf("ssrf guard: refusing to dial internal/non-routable address %q", address)
+			}
+			return nil
+		},
+	}
+}
 
 // HandleControlConn manages the lifecycle of a single control-plane connection:
 // registration handshake → message loop → cleanup.
@@ -128,10 +169,11 @@ func HandleControlConn(
 		return
 	}
 
-	// Serialising writer that owns this control connection: every write (proxy
-	// OpenConnection, SOCKS frames, tunnel responses, heartbeat) goes through it
-	// so length-prefix + body stay atomic relative to concurrent writers.
-	cw := tunnel.NewCtrlConnWriter(conn)
+	// The single serialising writer for this control connection (created in
+	// reg.Register). Every write — proxy OpenConnection, SOCKS frames, tunnel
+	// responses, disconnect, heartbeat — goes through this ONE writer so the
+	// length-prefix + body stay atomic relative to concurrent writers.
+	cw := client.Writer
 
 	// Register control connection in ControlConnRegistry if provided.
 	var ccReg *tunnel.ControlConnRegistry
@@ -317,8 +359,10 @@ func handleServerSOCKSConnect(
 		}
 		defer mux.Remove(sc.ConnID)
 
-		// Dial the internet target (server has internet access).
-		targetConn, err := net.DialTimeout("tcp", targetAddr, config.DataConnWaitTimeout)
+		// Dial the internet target (server has internet access). The SSRF guard
+		// in newSOCKSDialer blocks loopback/private/link-local destinations unless
+		// AllowPrivateTargets is enabled.
+		targetConn, err := newSOCKSDialer(config.SOCKSDialTimeout).DialContext(ctx, "tcp", targetAddr)
 		if err != nil {
 			log.Warn("server: failed to dial target", "err", err)
 			if werr := cw.Write(protocol.MsgSOCKSReady, protocol.SOCKSReady{

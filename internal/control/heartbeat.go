@@ -42,8 +42,9 @@ func StartHeartbeat(ctx context.Context, client *Client, log *slog.Logger) {
 				return
 			}
 
-			// Send Ping with the current miss count as the sequence number.
-			if err := protocol.WriteMessage(client.Conn, protocol.MsgPing, protocol.Ping{Seq: uint64(missed)}); err != nil {
+			// Send Ping through the serialising writer so it cannot interleave
+			// with proxy/control writes on the same connection.
+			if err := client.Writer.Write(protocol.MsgPing, protocol.Ping{Seq: uint64(missed)}); err != nil {
 				log.Warn("ping write failed", "id", client.ID, "err", err)
 				client.cancelFn()
 				return
