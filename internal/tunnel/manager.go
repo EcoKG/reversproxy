@@ -1,6 +1,9 @@
 package tunnel
 
 import (
+	"crypto/rand"
+	"crypto/subtle"
+	"encoding/hex"
 	"fmt"
 	"net"
 	"sync"
@@ -9,9 +12,13 @@ import (
 // pendingConn holds the external user's net.Conn while waiting for the client
 // to dial back with a matching data connection.
 type pendingConn struct {
-	extConn  net.Conn
-	ready    chan struct{} // closed when dataConn is filled
-	dataConn net.Conn
+	extConn   net.Conn
+	ready     chan struct{} // closed when dataConn is filled
+	dataConn  net.Conn
+	closeOnce sync.Once // guards close(ready) so Fulfill/Cancel cannot double-close
+	// dataToken is a per-connection single-use secret sent to the legitimate
+	// client in OpenConnection; the data conn must echo it in DataConnHello.
+	dataToken string
 }
 
 // pendingSOCKS holds state for an in-progress SOCKS5 CONNECT request.
@@ -124,8 +131,9 @@ func (m *Manager) RemoveTunnelsForClient(clientID string) {
 // pendingConn so the caller can wait for the data connection.
 func (m *Manager) RegisterPending(connID string, extConn net.Conn) *pendingConn {
 	p := &pendingConn{
-		extConn: extConn,
-		ready:   make(chan struct{}),
+		extConn:   extConn,
+		ready:     make(chan struct{}),
+		dataToken: newDataToken(),
 	}
 	m.mu.Lock()
 	m.pending[connID] = p
@@ -133,31 +141,56 @@ func (m *Manager) RegisterPending(connID string, extConn net.Conn) *pendingConn 
 	return p
 }
 
+// newDataToken returns a 256-bit cryptographically-random hex token. On the
+// (practically impossible) event of an RNG failure it returns "", which
+// FulfillPending then rejects — failing closed.
+func newDataToken() string {
+	var b [32]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return ""
+	}
+	return hex.EncodeToString(b[:])
+}
+
+// Token returns this pending connection's single-use data token. Used by the
+// legacy SOCKS server→client path, which threads the token through SOCKSConnect
+// instead of OpenConnection.
+func (p *pendingConn) Token() string { return p.dataToken }
+
 // CancelPending removes a pending connection entry without fulfilling it.
 // This cleans up the map entry when the external conn is closed before the
 // client dials back (e.g. context cancelled, timeout).
 func (m *Manager) CancelPending(connID string) {
 	m.mu.Lock()
+	p, ok := m.pending[connID]
 	delete(m.pending, connID)
 	m.mu.Unlock()
+	if ok {
+		// Unblock any WaitReady so the relay goroutine doesn't leak.
+		p.closeOnce.Do(func() { close(p.ready) })
+	}
 }
 
 // FulfillPending matches a client data connection to the waiting external
 // connection identified by connID. Returns an error if connID is unknown.
-func (m *Manager) FulfillPending(connID string, dataConn net.Conn) error {
+func (m *Manager) FulfillPending(connID string, dataConn net.Conn, token string) error {
 	m.mu.Lock()
 	p, ok := m.pending[connID]
-	if ok {
-		delete(m.pending, connID)
-	}
-	m.mu.Unlock()
-
 	if !ok {
+		m.mu.Unlock()
 		return fmt.Errorf("tunnel manager: unknown connID %q", connID)
 	}
+	// Constant-time check that the data conn echoed the single-use token the
+	// server handed the legitimate client — blocks connID-spoofing on data conns.
+	if p.dataToken == "" || subtle.ConstantTimeCompare([]byte(p.dataToken), []byte(token)) != 1 {
+		m.mu.Unlock()
+		return fmt.Errorf("tunnel manager: invalid data token for connID %q", connID)
+	}
+	delete(m.pending, connID)
+	m.mu.Unlock()
 
 	p.dataConn = dataConn
-	close(p.ready)
+	p.closeOnce.Do(func() { close(p.ready) })
 	return nil
 }
 

@@ -121,12 +121,17 @@ type OpenConnection struct {
 	// LocalHost and LocalPort tell the client which local service to connect to.
 	LocalHost string
 	LocalPort int
+	// DataToken is a single-use secret the client must echo in DataConnHello to
+	// prove it is the legitimate owner of this connID when opening the data conn.
+	DataToken string
 }
 
 // DataConnHello is the first message sent by the client on a new data
 // connection to identify which external connection it is handling.
 type DataConnHello struct {
 	ConnID string
+	// Token must match the DataToken from the corresponding OpenConnection.
+	Token string
 }
 
 // RequestHTTPTunnel is sent by the client to register a hostname so that
@@ -180,6 +185,9 @@ type SOCKSConnect struct {
 	TargetHost string
 	// TargetPort is the destination port.
 	TargetPort int
+	// DataToken is the single-use secret the data connection must echo in
+	// DataConnHello (server→client SOCKS path; mirrors OpenConnection.DataToken).
+	DataToken string
 }
 
 // SOCKSReady is sent by the SERVER back to the CLIENT after it has dialled

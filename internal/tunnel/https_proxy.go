@@ -152,8 +152,9 @@ func handleHTTPSConn(
 		ConnID:    connID,
 		LocalHost: entry.LocalHost,
 		LocalPort: entry.LocalPort,
+		DataToken: pending.dataToken,
 	}
-	if err := protocol.WriteMessage(clientConn, protocol.MsgOpenConnection, openMsg); err != nil {
+	if err := clientConn.Write(protocol.MsgOpenConnection, openMsg); err != nil {
 		log.Warn("HTTPS proxy: failed to send OpenConnection", "connID", connID, "err", err)
 		extConn.Close()
 		return

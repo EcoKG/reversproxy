@@ -93,7 +93,7 @@ func connectFakeClient(t *testing.T, env *testEnv) (cleanup func()) {
 
 	// Register the server-side half so the SOCKS proxy can send messages.
 	clientID := "fake-client-1"
-	env.ctrlConns.Register(clientID, serverSide)
+	env.ctrlConns.Register(clientID, tunnel.NewCtrlConnWriter(serverSide))
 
 	// Server-side reader: processes replies that come from the client side.
 	// This replaces the role of HandleControlConn's message loop for the
@@ -183,6 +183,7 @@ func handleFakeSOCKSConnect(
 
 	if err := protocol.WriteMessage(dataConn, protocol.MsgDataConnHello, protocol.DataConnHello{
 		ConnID: sc.ConnID,
+		Token:  sc.DataToken,
 	}); err != nil {
 		targetConn.Close()
 		dataConn.Close()
@@ -625,7 +626,7 @@ func TestSOCKS5_WithRealClientHandler(t *testing.T) {
 	// Use net.Pipe() to simulate the control channel.
 	serverSide, clientSide := net.Pipe()
 	clientID := "real-client-1"
-	ctrlConns.Register(clientID, serverSide)
+	ctrlConns.Register(clientID, tunnel.NewCtrlConnWriter(serverSide))
 	defer func() {
 		ctrlConns.Deregister(clientID)
 		serverSide.Close()

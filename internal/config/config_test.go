@@ -17,8 +17,35 @@ func TestLoadServerConfig_MissingFile(t *testing.T) {
 	if cfg.DataAddr != ":8444" {
 		t.Errorf("DataAddr: got %q, want %q", cfg.DataAddr, ":8444")
 	}
-	if cfg.AuthToken != "changeme" {
-		t.Errorf("AuthToken: got %q, want %q", cfg.AuthToken, "changeme")
+	// Secure default: AuthToken is empty (operator must supply one; ValidateSecurity
+	// fails closed unless insecure). It is no longer the well-known "changeme".
+	if cfg.AuthToken != "" {
+		t.Errorf("AuthToken: got %q, want %q (empty secure default)", cfg.AuthToken, "")
+	}
+	if cfg.Insecure {
+		t.Errorf("Insecure: got true, want false (secure default)")
+	}
+}
+
+func TestValidateSecurity(t *testing.T) {
+	// Fail-closed: empty/default token rejected unless insecure.
+	if err := (&config.ServerConfig{}).ValidateSecurity(); err == nil {
+		t.Error("ServerConfig: empty token should fail ValidateSecurity")
+	}
+	if err := (&config.ServerConfig{AuthToken: "changeme"}).ValidateSecurity(); err == nil {
+		t.Error("ServerConfig: 'changeme' token should fail ValidateSecurity")
+	}
+	if err := (&config.ServerConfig{AuthToken: "strong-token"}).ValidateSecurity(); err != nil {
+		t.Errorf("ServerConfig: strong token should pass, got: %v", err)
+	}
+	if err := (&config.ServerConfig{Insecure: true}).ValidateSecurity(); err != nil {
+		t.Errorf("ServerConfig: insecure mode should tolerate weak token, got: %v", err)
+	}
+	if err := (&config.ClientConfig{AuthToken: "strong-token"}).ValidateSecurity(); err != nil {
+		t.Errorf("ClientConfig: strong token should pass, got: %v", err)
+	}
+	if err := (&config.ClientConfig{}).ValidateSecurity(); err == nil {
+		t.Error("ClientConfig: empty token should fail ValidateSecurity")
 	}
 }
 

@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/EcoKG/reversproxy/internal/tunnel"
 )
 
 // Client represents a connected control-plane client.
@@ -18,7 +20,11 @@ type Client struct {
 	RegisteredAt  time.Time
 	lastHeartbeat atomic.Value // stores time.Time
 	Conn          net.Conn
-	cancelFn      context.CancelFunc
+	// Writer serialises all protocol writes to Conn. Every writer (heartbeat,
+	// proxy OpenConnection sends, control responses, disconnect) must use it so
+	// frames cannot interleave on the wire.
+	Writer   *tunnel.CtrlConnWriter
+	cancelFn context.CancelFunc
 }
 
 // SetLastHeartbeat atomically updates the last heartbeat timestamp.
@@ -57,6 +63,7 @@ func (r *ClientRegistry) Register(name, addr string, conn net.Conn, cancelFn con
 		Addr:         addr,
 		RegisteredAt: time.Now(),
 		Conn:         conn,
+		Writer:       tunnel.NewCtrlConnWriter(conn),
 		cancelFn:     cancelFn,
 	}
 	client.SetLastHeartbeat(time.Now())
