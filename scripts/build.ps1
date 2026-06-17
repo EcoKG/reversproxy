@@ -74,6 +74,7 @@ try {
         Write-Host 'Windows:' -ForegroundColor Green
         Build-One 'windows' $Arch './cmd/server'    (Join-Path $d 'reversproxy-server.exe')
         Build-One 'windows' $Arch './cmd/winclient' (Join-Path $d 'reversproxy-client.exe') '-s -w -H windowsgui'
+        Build-One 'windows' $Arch './cmd/winserver' (Join-Path $d 'reversproxy-winserver.exe') '-s -w -H windowsgui'
         Copy-Configs $d
     }
 
@@ -83,8 +84,9 @@ try {
     $pairs = @(
         @{ src = "dist/linux/reversproxy-server";       dst = "reversproxy-server-linux-$Arch" },
         @{ src = "dist/linux/reversproxy-client";       dst = "reversproxy-client-linux-$Arch" },
-        @{ src = "dist/windows/reversproxy-server.exe"; dst = "reversproxy-server-windows-$Arch.exe" },
-        @{ src = "dist/windows/reversproxy-client.exe"; dst = "reversproxy-client-windows-$Arch.exe" }
+        @{ src = "dist/windows/reversproxy-server.exe";   dst = "reversproxy-server-windows-$Arch.exe" },
+        @{ src = "dist/windows/reversproxy-client.exe";   dst = "reversproxy-client-windows-$Arch.exe" },
+        @{ src = "dist/windows/reversproxy-winserver.exe"; dst = "reversproxy-winserver-windows-$Arch.exe" }
     )
     foreach ($p in $pairs) {
         $s = Join-Path $root $p.src
