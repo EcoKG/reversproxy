@@ -57,6 +57,7 @@ if [ "$TARGET_OS" = "all" ] || [ "$TARGET_OS" = "windows" ]; then
     echo "Windows:"
     build_one windows ./cmd/server    dist/windows/reversproxy-server.exe
     build_one windows ./cmd/winclient dist/windows/reversproxy-client.exe '-s -w -H windowsgui'
+    build_one windows ./cmd/winserver dist/windows/reversproxy-winserver.exe '-s -w -H windowsgui'
     copy_configs dist/windows
 fi
 
@@ -66,6 +67,7 @@ mkdir -p dist/release
 [ -f dist/linux/reversproxy-client ]       && cp -f dist/linux/reversproxy-client       "dist/release/reversproxy-client-linux-$ARCH"
 [ -f dist/windows/reversproxy-server.exe ] && cp -f dist/windows/reversproxy-server.exe "dist/release/reversproxy-server-windows-$ARCH.exe"
 [ -f dist/windows/reversproxy-client.exe ] && cp -f dist/windows/reversproxy-client.exe "dist/release/reversproxy-client-windows-$ARCH.exe"
+[ -f dist/windows/reversproxy-winserver.exe ] && cp -f dist/windows/reversproxy-winserver.exe "dist/release/reversproxy-winserver-windows-$ARCH.exe"
 
 echo
 echo "완료. 산출물: $ROOT/dist"

@@ -16,6 +16,7 @@ import (
 	"github.com/EcoKG/reversproxy/internal/admin"
 	"github.com/EcoKG/reversproxy/internal/config"
 	"github.com/EcoKG/reversproxy/internal/control"
+	"github.com/EcoKG/reversproxy/internal/filetransfer"
 	"github.com/EcoKG/reversproxy/internal/logger"
 	"github.com/EcoKG/reversproxy/internal/stats"
 	"github.com/EcoKG/reversproxy/internal/tunnel"
@@ -83,8 +84,26 @@ func NewServerApp(cfg *config.ServerConfig) (*ServerApp, error) {
 	return app, nil
 }
 
+// Config returns the server configuration (read-only use by GUI/admin layers).
+func (app *ServerApp) Config() *config.ServerConfig { return app.config }
+
+// Registry returns the live client registry.
+func (app *ServerApp) Registry() *control.ClientRegistry { return app.registry }
+
+// Manager returns the tunnel manager (active tunnels).
+func (app *ServerApp) Manager() *tunnel.Manager { return app.manager }
+
+// StatsRegistry returns the per-tunnel stats registry.
+func (app *ServerApp) StatsRegistry() *stats.Registry { return app.statsReg }
+
+// GlobalStats returns the aggregate server stats.
+func (app *ServerApp) GlobalStats() *stats.ServerStats { return app.globalStats }
+
 // Start starts the server application and blocks until the context is cancelled.
 func (app *ServerApp) Start(ctx context.Context) error {
+	// Apply the SSRF egress policy before any control connection is handled.
+	control.SetAllowPrivateSOCKSTargets(app.config.AllowPrivateTargets)
+
 	app.log.Info("starting server",
 		"data_addr", app.config.DataAddr,
 		"http_addr", app.config.HTTPAddr,
@@ -158,6 +177,19 @@ func (app *ServerApp) Start(ctx context.Context) error {
 			return fmt.Errorf("failed to start admin server: %w", err)
 		}
 		app.log.Info("admin API started", "addr", app.config.AdminAddr)
+	}
+
+	// File-transfer receiver (drop folder), if enabled — preserves the feature
+	// for the GUI server.
+	if app.config.FileTransfer.Enabled {
+		ft := app.config.FileTransfer
+		if recv, ferr := filetransfer.NewReceiver(ft.DropDir, ft.Token, ft.MaxFileSize, app.log); ferr != nil {
+			app.log.Error("file transfer: receiver init failed", "err", ferr)
+		} else if ftAddr, serr := filetransfer.StartReceiver(ctx, ft.ReceiveAddr, recv); serr != nil {
+			app.log.Error("file transfer: receiver start failed", "err", serr)
+		} else {
+			app.log.Info("file transfer receiver listening", "addr", ftAddr, "drop_dir", recv.Dir())
+		}
 	}
 
 	// Start client dial loops

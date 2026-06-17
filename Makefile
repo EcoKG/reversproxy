@@ -12,7 +12,7 @@ GOBUILD := CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS)'
 
 .PHONY: build build-all test run-server run-client lint \
         dist dist-linux dist-windows \
-        server-linux client-linux server-windows client-windows clean
+        server-linux client-linux server-windows client-windows winserver-windows clean
 
 # 현재 호스트 OS용 전체 빌드(검증용).
 build:
@@ -39,7 +39,7 @@ build-all: dist
 dist: dist-linux dist-windows
 
 dist-linux: server-linux client-linux
-dist-windows: server-windows client-windows
+dist-windows: server-windows client-windows winserver-windows
 
 server-linux:
 	@mkdir -p dist/linux
@@ -58,6 +58,11 @@ server-windows:
 client-windows:
 	@mkdir -p dist/windows
 	GOOS=windows GOARCH=$(ARCH) CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS) -H windowsgui' -o dist/windows/reversproxy-client.exe ./cmd/winclient
+
+# Windows 서버 GUI(cmd/winserver) — 트레이 + 네이티브 관리 콘솔(lxn/walk). -H windowsgui.
+winserver-windows:
+	@mkdir -p dist/windows
+	GOOS=windows GOARCH=$(ARCH) CGO_ENABLED=0 go build -trimpath -ldflags '$(LDFLAGS) -H windowsgui' -o dist/windows/reversproxy-winserver.exe ./cmd/winserver
 
 clean:
 	rm -rf dist

@@ -127,3 +127,23 @@ func (r *ClientRegistry) DisconnectByName(name string) int {
 	}
 	return len(matches)
 }
+
+// Disconnect invokes the cancel function and closes the underlying conn for the
+// client with the given ID. Returns true if a matching client was found. The
+// dial loop re-dials automatically per its reconnect logic. Used by the GUI
+// management console's per-client disconnect action.
+func (r *ClientRegistry) Disconnect(id string) bool {
+	r.mu.RLock()
+	c, ok := r.clients[id]
+	r.mu.RUnlock()
+	if !ok {
+		return false
+	}
+	if c.cancelFn != nil {
+		c.cancelFn()
+	}
+	if c.Conn != nil {
+		_ = c.Conn.Close()
+	}
+	return true
+}
