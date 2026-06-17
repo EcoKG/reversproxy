@@ -85,7 +85,8 @@ GOOS=windows GOARCH=amd64 go build -ldflags '-H windowsgui' \
 #### 1. `cmd/` - 애플리케이션 진입점
 - **client**: CLI 클라이언트 (크로스플랫폼; 리눅스 기본 클라이언트)
 - **server**: 서버 애플리케이션 (크로스플랫폼 CLI)
-- **winclient**: 윈도우 GUI 시스템 트레이 클라이언트 (`//go:build windows`; `cmd/client`와 동일한 `internal/client` 로직을 트레이 UI로 감쌈)
+- **winclient**: 윈도우 네이티브 GUI 클라이언트 (`//go:build windows`; systray + lxn/walk 관리콘솔/설정, `internal/client` 로직 + 우클릭 파일전송)
+- **winserver**: 윈도우 네이티브 GUI 서버 (`//go:build windows`; systray + lxn/walk 관리콘솔, `internal/app.Start`로 풀기능 서버 구동 — NSSM 서비스 대안)
 
 #### 2. `internal/` - 비공개 라이브러리
 

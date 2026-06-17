@@ -79,6 +79,12 @@ func main() {
 	// ------------------------------------------------------------------ //
 	log := logger.NewWithLevel("server", cfg.LogLevel)
 
+	// Fail closed on weak credentials unless insecure (dev) mode is enabled.
+	if err := cfg.ValidateSecurity(); err != nil {
+		log.Error("insecure configuration — refusing to start", "err", err)
+		os.Exit(1)
+	}
+
 	// Apply the SSRF egress policy before any control connection is handled.
 	control.SetAllowPrivateSOCKSTargets(cfg.AllowPrivateTargets)
 
