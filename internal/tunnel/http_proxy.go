@@ -181,6 +181,7 @@ func handleHTTPConn(
 		ConnID:    connID,
 		LocalHost: entry.LocalHost,
 		LocalPort: entry.LocalPort,
+		DataToken: pending.dataToken,
 	}
 	if err := clientConn.Write(protocol.MsgOpenConnection, openMsg); err != nil {
 		log.Warn("HTTP proxy: failed to send OpenConnection", "connID", connID, "err", err)

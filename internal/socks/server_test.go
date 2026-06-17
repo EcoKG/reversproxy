@@ -183,6 +183,7 @@ func handleFakeSOCKSConnect(
 
 	if err := protocol.WriteMessage(dataConn, protocol.MsgDataConnHello, protocol.DataConnHello{
 		ConnID: sc.ConnID,
+		Token:  sc.DataToken,
 	}); err != nil {
 		targetConn.Close()
 		dataConn.Close()

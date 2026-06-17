@@ -78,9 +78,10 @@ func handleSOCKSConnectAsync(
 		_ = tc.SetKeepAlivePeriod(15 * time.Second)
 	}
 
-	// 3. Identify this data connection to the server.
+	// 3. Identify this data connection to the server (echo the DataToken).
 	if err := protocol.WriteMessage(dataConn, protocol.MsgDataConnHello, protocol.DataConnHello{
 		ConnID: msg.ConnID,
+		Token:  msg.DataToken,
 	}); err != nil {
 		if werr := protocol.WriteMessage(ctrlConn, protocol.MsgSOCKSReady, protocol.SOCKSReady{
 			ConnID:  msg.ConnID,
@@ -145,9 +146,10 @@ func handleOpenConnAsync(msg protocol.OpenConnection, serverDataAddr string, log
 		_ = tc.SetKeepAlivePeriod(15 * time.Second)
 	}
 
-	// 2. Send DataConnHello.
+	// 2. Send DataConnHello (echo the single-use DataToken to prove ownership).
 	if err := protocol.WriteMessage(dataConn, protocol.MsgDataConnHello, protocol.DataConnHello{
 		ConnID: msg.ConnID,
+		Token:  msg.DataToken,
 	}); err != nil {
 		return fmt.Errorf("write DataConnHello: %w", err)
 	}

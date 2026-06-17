@@ -92,7 +92,7 @@ func handleDataConn(conn net.Conn, mgr *Manager, log *slog.Logger) {
 		return
 	}
 
-	if err := mgr.FulfillPending(hello.ConnID, conn); err != nil {
+	if err := mgr.FulfillPending(hello.ConnID, conn, hello.Token); err != nil {
 		log.Warn("data conn: fulfill failed", "connID", hello.ConnID, "err", err)
 		conn.Close()
 		return
@@ -149,6 +149,7 @@ func StartPublicListener(
 			ConnID:    connID,
 			LocalHost: entry.LocalHost,
 			LocalPort: entry.LocalPort,
+			DataToken: pending.dataToken,
 		}
 		if err := cw.Write(protocol.MsgOpenConnection, openMsg); err != nil {
 			log.Warn("failed to send OpenConnection to client", "connID", connID, "err", err)

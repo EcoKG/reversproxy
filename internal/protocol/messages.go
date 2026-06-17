@@ -185,6 +185,9 @@ type SOCKSConnect struct {
 	TargetHost string
 	// TargetPort is the destination port.
 	TargetPort int
+	// DataToken is the single-use secret the data connection must echo in
+	// DataConnHello (server→client SOCKS path; mirrors OpenConnection.DataToken).
+	DataToken string
 }
 
 // SOCKSReady is sent by the SERVER back to the CLIENT after it has dialled
