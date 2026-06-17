@@ -29,7 +29,7 @@ import (
 	"github.com/getlantern/systray"
 )
 
-//go:embed assets/icon.png
+//go:embed assets/icon.ico
 var iconData []byte
 
 // connStateVal represents the current tunnel connection state.
@@ -44,11 +44,31 @@ const (
 // currentState tracks live connection status for tray updates.
 var currentState atomic.Int32
 
-// cancelFn holds the current tunnel context canceller. Protected by mu.
+// configPath and logPath are resolved in onReady and read by the management
+// console (console.go) and settings dialog (settings.go).
 var (
-	mu       sync.Mutex
-	cancelFn context.CancelFunc
+	configPath string
+	logPath    string
 )
+
+// cancelFn holds the current tunnel context canceller; reconnectFn performs a
+// disconnect+reconnect (wired in onReady, invoked by the console). Protected by mu.
+var (
+	mu          sync.Mutex
+	cancelFn    context.CancelFunc
+	reconnectFn func()
+)
+
+// reconnectTunnel disconnects and re-establishes the tunnel. Invoked from the
+// management console's "재연결" button.
+func reconnectTunnel() {
+	mu.Lock()
+	fn := reconnectFn
+	mu.Unlock()
+	if fn != nil {
+		go fn()
+	}
+}
 
 func main() {
 	// Handle CLI-style subcommands (send-file / register-menu / unregister-menu)
@@ -73,6 +93,11 @@ func onReady() {
 	mReg := systray.AddMenuItem("우클릭 메뉴 등록", "탐색기 우클릭에 '파일 전송' 추가")
 	mUnreg := systray.AddMenuItem("우클릭 메뉴 해제", "탐색기 우클릭 메뉴 제거")
 	systray.AddSeparator()
+	mConsole := systray.AddMenuItem("관리 콘솔 열기", "상태/로그 보기")
+	mSettings := systray.AddMenuItem("설정", "GUI로 설정 편집")
+	mReconnect := systray.AddMenuItem("재연결", "연결 끊고 다시 연결")
+	mAutostart := systray.AddMenuItemCheckbox("로그온 시 자동 실행", "Windows 로그온 시 자동 시작", isAutoStartEnabled())
+	systray.AddSeparator()
 	mQuit := systray.AddMenuItem("종료", "프로그램 종료")
 
 	// Determine exe directory; fall back to "." if os.Executable fails.
@@ -81,10 +106,10 @@ func onReady() {
 	if exeErr == nil {
 		exeDir = filepath.Dir(exePath)
 	}
-	configPath := filepath.Join(exeDir, "config.yaml")
+	configPath = filepath.Join(exeDir, "config.yaml")
 
 	// Open log file next to the executable.
-	logPath := filepath.Join(exeDir, "winclient.log")
+	logPath = filepath.Join(exeDir, "winclient.log")
 	logFile, logErr := os.OpenFile(logPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if logErr != nil {
 		showError("Reversproxy", "로그 파일을 열 수 없습니다:\n"+logErr.Error())
@@ -135,6 +160,36 @@ func onReady() {
 				log.Info("file transfer control server listening", "addr", ft.ControlAddr)
 			}
 		}
+	}
+
+	// Wire reconnect (used by the management console) and seed the status
+	// snapshot for the console/settings views.
+	reconnectFn = func() {
+		mu.Lock()
+		if cancelFn != nil {
+			cancelFn()
+		}
+		mu.Unlock()
+		updateStatus(mStatus, mToggle, stateDisconnected)
+		time.Sleep(500 * time.Millisecond)
+		if _, statErr := os.Stat(configPath); statErr != nil {
+			return
+		}
+		rcfg, lerr := config.LoadClientConfig(configPath)
+		if lerr != nil {
+			return
+		}
+		ctx, cancel := context.WithCancel(rootCtx)
+		mu.Lock()
+		cancelFn = cancel
+		mu.Unlock()
+		updateStatus(mStatus, mToggle, stateConnecting)
+		go runTunnelLoop(ctx, rcfg, mStatus, mToggle)
+	}
+	if scfg, serr := config.LoadClientConfig(configPath); serr == nil {
+		status.setConfig(scfg, configPath, logPath)
+	} else {
+		status.setConfig(nil, configPath, logPath)
 	}
 
 	// Auto-connect on startup: check file existence first, then load.
@@ -222,6 +277,25 @@ func onReady() {
 
 		case <-mUnreg.ClickedCh:
 			unregisterContextMenu()
+
+		case <-mConsole.ClickedCh:
+			openConsole()
+
+		case <-mSettings.ClickedCh:
+			openSettingsDialog()
+
+		case <-mReconnect.ClickedCh:
+			reconnectTunnel()
+
+		case <-mAutostart.ClickedCh:
+			enable := !mAutostart.Checked()
+			if err := setAutoStart(enable); err != nil {
+				showError("Reversproxy", "자동 실행 설정 실패:\n"+err.Error())
+			} else if enable {
+				mAutostart.Check()
+			} else {
+				mAutostart.Uncheck()
+			}
 
 		case <-mQuit.ClickedCh:
 			mu.Lock()
@@ -366,6 +440,7 @@ func handleServerSession(
 // updateStatus sets the connection state and updates the tray tooltip and menu labels.
 func updateStatus(mStatus *systray.MenuItem, mToggle *systray.MenuItem, state connStateVal) {
 	currentState.Store(int32(state))
+	status.setState(state, "")
 	switch state {
 	case stateDisconnected:
 		mStatus.SetTitle("상태: 연결 안됨")
