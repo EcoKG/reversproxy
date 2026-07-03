@@ -1,0 +1,62 @@
+# =============================================================================
+# reversproxy 서버 설정 샘플 — 파일 전송(드롭 폴더 + 우클릭/CLI) 포함
+# -----------------------------------------------------------------------------
+# 이 파일을 config.yaml 로 복사한 뒤 CHANGE-ME 값을 채워 사용하세요.
+#   ./reversproxy-server --config config.yaml
+# 배선(토폴로지) 설명은 FILE_TRANSFER.md 를 참고하세요.
+#
+# 이 예시는 두 거점을 가정합니다:
+#   site-a = NAT 뒤 클라이언트 (서버가 이쪽으로 접속)
+#   site-b = 이 서버(공인 IP)
+# =============================================================================
+
+# 데이터 커넥션 리슨 주소.
+data_addr:  "0.0.0.0:8444"
+
+# 평문 HTTP / SNI HTTPS 프록시 리스너 (필요 없으면 "" 로 비활성).
+http_addr:  ":8080"
+https_addr: ":8445"
+
+# 관리 API 리슨 주소 + Bearer 토큰(비우면 인증 없음 — 운영에서는 반드시 설정).
+admin_addr:  "127.0.0.1:9090"
+admin_token: "CHANGE-ME-admin-bearer-token"
+
+# 클라이언트와 공유하는 기본 사전 인증 토큰. clients[].auth_token 이 비면 이 값을 상속.
+# 비우거나 "changeme" 이면 (insecure:false 일 때) 시작이 거부됩니다.
+auth_token: "CHANGE-ME-strong-shared-token"
+
+# 운영에서는 false 로 두고 정상 인증서를 사용하세요. 자체 서명 테스트만 true.
+insecure: false
+
+log_level: "info"
+
+# 서버 리스너의 TLS 인증서/키.
+cert_path: "server.crt"
+key_path:  "server.key"
+
+# TOFU 지문 저장소. 미등록 클라이언트는 운영자 승인 전까지 차단됩니다.
+# 테스트 편의로 자동 승인하려면 auto_approve: true 를 추가하세요(운영 비권장).
+known_hosts_path: "known_hosts.yaml"
+# auto_approve: true
+
+# -----------------------------------------------------------------------------
+# 서버가 접속(dial)할 클라이언트 목록.
+# -----------------------------------------------------------------------------
+clients:
+  - name: "site-a"                     # 클라이언트 config 의 name 과 일치해야 함
+    address: "site-a-host:8443"        # 클라이언트 listen_addr 에 닿는 실제 host:port
+    auth_token: "CHANGE-ME-strong-shared-token"
+
+# -----------------------------------------------------------------------------
+# 파일 전송
+#   enabled:true 이면 서버 쪽 수신기가 자동으로 뜹니다.
+#   send_endpoint 는 "클라이언트가 tunnel 로 노출한 공개 포트(18089)" 입니다.
+#   token 은 클라이언트와 동일해야 합니다.
+# -----------------------------------------------------------------------------
+file_transfer:
+  enabled: true
+  receive_addr: "127.0.0.1:8089"            # 서버 수신 엔드포인트(루프백 바인딩)
+  drop_dir: "received"                       # 받은 파일 저장 폴더
+  token: "CHANGE-ME-shared-ft-secret"        # 양쪽 동일
+  send_endpoint: "http://127.0.0.1:18089"    # 보낼 대상 = 클라이언트 tunnel 공개 포트(18089)
+  max_file_size: 0                           # 0 = 무제한 (byte 단위)
